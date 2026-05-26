@@ -5,13 +5,12 @@ use indoc::indoc;
 
 use uv_static::EnvVars;
 
-use crate::common::TestContext;
-use crate::common::uv_snapshot;
+use uv_test::uv_snapshot;
 
 /// `cache prune` should be a no-op if there's nothing out-of-date in the cache.
 #[test]
 fn prune_no_op() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("anyio")?;
@@ -29,16 +28,17 @@ fn prune_no_op() -> Result<()> {
         .chain(std::iter::once((r"Removed \d+ files", "Removed [N] files")))
         .collect();
 
-    uv_snapshot!(&filters, context.prune().arg("--verbose"), @r###"
+    uv_snapshot!(&filters, context.prune().arg("--verbose"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
     DEBUG uv [VERSION] ([COMMIT] DATE)
     Pruning cache at: [CACHE_DIR]/
     No unused entries found
-    "###);
+    ");
 
     Ok(())
 }
@@ -46,7 +46,7 @@ fn prune_no_op() -> Result<()> {
 /// `cache prune` should remove any stale top-level directories from the cache.
 #[test]
 fn prune_stale_directory() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("anyio")?;
@@ -68,17 +68,18 @@ fn prune_stale_directory() -> Result<()> {
         .chain(std::iter::once((r"Removed \d+ files", "Removed [N] files")))
         .collect();
 
-    uv_snapshot!(&filters, context.prune().arg("--verbose"), @r###"
+    uv_snapshot!(&filters, context.prune().arg("--verbose"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
     DEBUG uv [VERSION] ([COMMIT] DATE)
     Pruning cache at: [CACHE_DIR]/
     DEBUG Removing dangling cache bucket: [CACHE_DIR]/simple-v4
     Removed 1 directory
-    "###);
+    ");
 
     Ok(())
 }
@@ -86,7 +87,7 @@ fn prune_stale_directory() -> Result<()> {
 /// `cache prune` should remove all cached environments from the cache.
 #[test]
 fn prune_cached_env() {
-    let context = TestContext::new("3.12").with_filtered_counts();
+    let context = uv_test::test_context!("3.12").with_filtered_counts();
     let tool_dir = context.temp_dir.child("tools");
     let bin_dir = context.temp_dir.child("bin");
 
@@ -100,7 +101,7 @@ fn prune_cached_env() {
         .arg("pytest@8.0.0")
         .arg("--version")
         .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())
-        .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str()), @r###"
+        .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str()), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -114,7 +115,7 @@ fn prune_cached_env() {
      + packaging==24.0
      + pluggy==1.4.0
      + pytest==8.0.0
-    "###);
+    ");
 
     let filters: Vec<_> = context
         .filters()
@@ -128,24 +129,25 @@ fn prune_cached_env() {
         ])
         .collect();
 
-    uv_snapshot!(filters, context.prune().arg("--verbose"), @r###"
+    uv_snapshot!(filters, context.prune().arg("--verbose"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
     DEBUG uv [VERSION] ([COMMIT] DATE)
     Pruning cache at: [CACHE_DIR]/
     DEBUG Removing dangling cache environment: [CACHE_DIR]/environments-v2/[ENTRY]
     DEBUG Removing dangling cache archive: [CACHE_DIR]/archive-v0/[ENTRY]
     Removed [N] files ([SIZE])
-    "###);
+    ");
 }
 
 /// `cache prune` should remove any stale symlink from the cache.
 #[test]
 fn prune_stale_symlink() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("anyio")?;
@@ -158,7 +160,7 @@ fn prune_stale_symlink() -> Result<()> {
         .success();
 
     // Remove the wheels directory, causing the symlink to become stale.
-    let wheels = context.cache_dir.child("wheels-v5");
+    let wheels = context.cache_dir.child("wheels-v6");
     fs_err::remove_dir_all(wheels)?;
 
     let filters: Vec<_> = context
@@ -173,17 +175,71 @@ fn prune_stale_symlink() -> Result<()> {
         ])
         .collect();
 
-    uv_snapshot!(filters, context.prune().arg("--verbose"), @r###"
+    uv_snapshot!(filters, context.prune().arg("--verbose"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
     DEBUG uv [VERSION] ([COMMIT] DATE)
     Pruning cache at: [CACHE_DIR]/
     DEBUG Removing dangling cache archive: [CACHE_DIR]/archive-v0/[ENTRY]
     Removed 44 files ([SIZE])
-    "###);
+    ");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn prune_force() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filtered_counts();
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str("typing-extensions\niniconfig")?;
+
+    // Install a requirement, to populate the cache.
+    context
+        .pip_sync()
+        .arg("requirements.txt")
+        .assert()
+        .success();
+
+    // When unlocked, `--force` should still take a lock
+    uv_snapshot!(context.filters(), context.prune().arg("--verbose").arg("--force"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
+    DEBUG uv [VERSION] ([COMMIT] DATE)
+    Pruning cache at: [CACHE_DIR]/
+    No unused entries found
+    ");
+
+    // Add a stale directory to the cache.
+    let simple = context.cache_dir.child("simple-v4");
+    simple.create_dir_all()?;
+
+    // When locked, `--force` should proceed without blocking
+    let _cache = uv_cache::Cache::from_path(context.cache_dir.path())
+        .with_exclusive_lock()
+        .await;
+    uv_snapshot!(context.filters(), context.prune().arg("--verbose").arg("--force"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
+    DEBUG uv [VERSION] ([COMMIT] DATE)
+    DEBUG Lock is busy for `[CACHE_DIR]/`
+    DEBUG Cache is currently in use, proceeding due to `--force`
+    Pruning cache at: [CACHE_DIR]/
+    DEBUG Removing dangling cache bucket: [CACHE_DIR]/simple-v4
+    Removed 1 directory
+    ");
 
     Ok(())
 }
@@ -191,7 +247,7 @@ fn prune_stale_symlink() -> Result<()> {
 /// `cache prune --ci` should remove all unzipped archives.
 #[test]
 fn prune_unzipped() -> Result<()> {
-    let context = TestContext::new("3.12").with_exclude_newer("2025-01-01T00:00Z");
+    let context = uv_test::test_context!("3.12").with_exclude_newer("2025-01-01T00:00Z");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(indoc! { r"
@@ -204,7 +260,7 @@ fn prune_unzipped() -> Result<()> {
         .collect();
 
     // Install a requirement, to populate the cache.
-    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--reinstall"), @r###"
+    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--reinstall"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -215,9 +271,9 @@ fn prune_unzipped() -> Result<()> {
     Installed 2 packages in [TIME]
      + iniconfig==2.0.0
      + source-distribution==0.0.1
-    "###);
+    ");
 
-    uv_snapshot!(&filters, context.prune().arg("--ci"), @r###"
+    uv_snapshot!(&filters, context.prune().arg("--ci"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -225,7 +281,7 @@ fn prune_unzipped() -> Result<()> {
     ----- stderr -----
     Pruning cache at: [CACHE_DIR]/
     Removed [N] files ([SIZE])
-    "###);
+    ");
 
     context.venv().arg("--clear").assert().success();
 
@@ -234,7 +290,7 @@ fn prune_unzipped() -> Result<()> {
     requirements_txt.write_str(indoc! { r"
         source-distribution==0.0.1
     " })?;
-    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--offline"), @r###"
+    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--offline"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -244,13 +300,13 @@ fn prune_unzipped() -> Result<()> {
     Prepared 1 package in [TIME]
     Installed 1 package in [TIME]
      + source-distribution==0.0.1
-    "###);
+    ");
 
     // But reinstalling the other package should require a download, since we pruned the wheel.
     requirements_txt.write_str(indoc! { r"
         iniconfig
     " })?;
-    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--offline"), @r"
+    uv_snapshot!(&filters, context.pip_install().arg("-r").arg("requirements.txt").arg("--offline"), @"
     success: false
     exit_code: 1
     ----- stdout -----
@@ -259,9 +315,8 @@ fn prune_unzipped() -> Result<()> {
       × No solution found when resolving dependencies:
       ╰─▶ Because all versions of iniconfig need to be downloaded from a registry and you require iniconfig, we can conclude that your requirements are unsatisfiable.
 
-          hint: Pre-releases are available for `iniconfig` in the requested range (e.g., 0.2.dev0), but pre-releases weren't enabled (try: `--prerelease=allow`)
-
-          hint: Packages were unavailable because the network was disabled. When the network is disabled, registry packages may only be read from the cache.
+    hint: Pre-releases are available for `iniconfig` in the requested range (e.g., 0.2.dev0), but pre-releases weren't enabled (try: `--prerelease=allow`)
+    hint: Packages were unavailable because the network was disabled. When the network is disabled, registry packages may only be read from the cache.
     ");
 
     Ok(())
@@ -270,7 +325,7 @@ fn prune_unzipped() -> Result<()> {
 /// `cache prune` should remove any stale source distribution revisions.
 #[test]
 fn prune_stale_revision() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -282,12 +337,17 @@ fn prune_stale_revision() -> Result<()> {
         dependencies = []
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
 
-    context.temp_dir.child("src").child("__init__.py").touch()?;
+    context
+        .temp_dir
+        .child("src")
+        .child("project")
+        .child("__init__.py")
+        .touch()?;
     context.temp_dir.child("README").touch()?;
 
     let filters: Vec<_> = context
@@ -300,7 +360,7 @@ fn prune_stale_revision() -> Result<()> {
     uv_snapshot!(&filters, context
         .pip_install()
         .arg(".")
-        .arg("--reinstall"), @r###"
+        .arg("--reinstall"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -310,12 +370,12 @@ fn prune_stale_revision() -> Result<()> {
     Prepared 1 package in [TIME]
     Installed 1 package in [TIME]
      + project==0.1.0 (from file://[TEMP_DIR]/)
-    "###);
+    ");
 
     uv_snapshot!(&filters, context
         .pip_install()
         .arg(".")
-        .arg("--reinstall"), @r###"
+        .arg("--reinstall"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -326,7 +386,7 @@ fn prune_stale_revision() -> Result<()> {
     Uninstalled 1 package in [TIME]
     Installed 1 package in [TIME]
      ~ project==0.1.0 (from file://[TEMP_DIR]/)
-    "###);
+    ");
 
     let filters: Vec<_> = filters
         .into_iter()
@@ -340,23 +400,27 @@ fn prune_stale_revision() -> Result<()> {
         .collect();
 
     // Pruning should remove the unused revision.
-    uv_snapshot!(&filters, context.prune().arg("--verbose"), @r###"
+    uv_snapshot!(&filters, context.prune().arg("--verbose"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
+    DEBUG Found workspace root: `[TEMP_DIR]/`
+    DEBUG Adding root workspace member: `[TEMP_DIR]/`
+    DEBUG Skipping `pyproject.toml` in `[TEMP_DIR]/` (no `[tool]` section)
+    DEBUG Searching for user configuration in: `[UV_USER_CONFIG_DIR]/uv.toml`
     DEBUG uv [VERSION] ([COMMIT] DATE)
     Pruning cache at: [CACHE_DIR]/
     DEBUG Removing dangling source revision: [CACHE_DIR]/sdists-v9/[ENTRY]
     DEBUG Removing dangling cache archive: [CACHE_DIR]/archive-v0/[ENTRY]
     Removed [N] files ([SIZE])
-    "###);
+    ");
 
     // Uninstall and reinstall the package. We should use the cached version.
     uv_snapshot!(&filters, context
         .pip_uninstall()
-        .arg("."), @r###"
+        .arg("."), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -364,11 +428,11 @@ fn prune_stale_revision() -> Result<()> {
     ----- stderr -----
     Uninstalled 1 package in [TIME]
      - project==0.1.0 (from file://[TEMP_DIR]/)
-    "###);
+    ");
 
     uv_snapshot!(&filters, context
         .pip_install()
-        .arg("."), @r###"
+        .arg("."), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -378,7 +442,7 @@ fn prune_stale_revision() -> Result<()> {
     Prepared 1 package in [TIME]
     Installed 1 package in [TIME]
      + project==0.1.0 (from file://[TEMP_DIR]/)
-    "###);
+    ");
 
     Ok(())
 }

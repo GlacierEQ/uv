@@ -3,25 +3,26 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use owo_colors::OwoColorize;
 use tracing::{debug, warn};
 
 use uv_cache::Cache;
+use uv_client::BaseClientBuilder;
 use uv_configuration::{
-    Concurrency, DependencyGroups, DryRun, EditableMode, ExtrasSpecification, InstallOptions,
-    Preview,
+    Concurrency, DependencyGroups, DryRun, ExtrasSpecification, InstallOptions,
 };
 use uv_fs::Simplified;
 use uv_normalize::PackageName;
 use uv_normalize::{DEV_DEPENDENCIES, DefaultExtras, DefaultGroups};
+use uv_preview::Preview;
 use uv_python::{PythonDownloads, PythonPreference, PythonRequest};
 use uv_scripts::{Pep723Metadata, Pep723Script};
-use uv_settings::PythonInstallMirrors;
+use uv_settings::{MalwareCheckSettings, PythonInstallMirrors};
 use uv_warnings::warn_user_once;
-use uv_workspace::pyproject::DependencyType;
+use uv_workspace::pyproject::{DependencyType, PyProjectToml};
 use uv_workspace::pyproject_mut::{DependencyTarget, PyProjectTomlMut};
-use uv_workspace::{DiscoveryOptions, VirtualProject, Workspace, WorkspaceCache};
+use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceCache};
 
 use crate::commands::pip::loggers::{DefaultInstallLogger, DefaultResolveLogger};
 use crate::commands::pip::operations::Modifications;
@@ -31,18 +32,17 @@ use crate::commands::project::lock::LockMode;
 use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::{
     ProjectEnvironment, ProjectError, ProjectInterpreter, ScriptInterpreter, UniversalState,
-    default_dependency_groups,
+    WorkspacePython, default_dependency_groups,
 };
 use crate::commands::{ExitStatus, diagnostics, project};
 use crate::printer::Printer;
-use crate::settings::{NetworkSettings, ResolverInstallerSettings};
+use crate::settings::{FrozenSource, LockCheck, ResolverInstallerSettings};
 
 /// Remove one or more packages from the project requirements.
-#[allow(clippy::fn_params_excessive_bools)]
 pub(crate) async fn remove(
     project_dir: &Path,
-    locked: bool,
-    frozen: bool,
+    lock_check: LockCheck,
+    frozen: Option<FrozenSource>,
     active: Option<bool>,
     no_sync: bool,
     packages: Vec<PackageName>,
@@ -51,7 +51,7 @@ pub(crate) async fn remove(
     python: Option<String>,
     install_mirrors: PythonInstallMirrors,
     settings: ResolverInstallerSettings,
-    network_settings: NetworkSettings,
+    client_builder: BaseClientBuilder<'_>,
     script: Option<Pep723Script>,
     python_preference: PythonPreference,
     python_downloads: PythonDownloads,
@@ -61,6 +61,7 @@ pub(crate) async fn remove(
     cache: &Cache,
     printer: Printer,
     preview: Preview,
+    malware_settings: MalwareCheckSettings,
 ) -> Result<ExitStatus> {
     let target = if let Some(script) = script {
         // If we found a PEP 723 script and the user provided a project-only setting, warn.
@@ -69,12 +70,12 @@ pub(crate) async fn remove(
                 "`--package` is a no-op for Python scripts with inline metadata, which always run in isolation"
             );
         }
-        if locked {
+        if let LockCheck::Enabled(lock_check) = lock_check {
             warn_user_once!(
-                "`--locked` is a no-op for Python scripts with inline metadata, which always run in isolation"
+                "`{lock_check}` is a no-op for Python scripts with inline metadata, which always run in isolation",
             );
         }
-        if frozen {
+        if frozen.is_some() {
             warn_user_once!(
                 "`--frozen` is a no-op for Python scripts with inline metadata, which always run in isolation"
             );
@@ -89,16 +90,13 @@ pub(crate) async fn remove(
         // Find the project in the workspace.
         // No workspace caching since `uv remove` changes the workspace definition.
         let project = if let Some(package) = package {
-            VirtualProject::Project(
-                Workspace::discover(
-                    project_dir,
-                    &DiscoveryOptions::default(),
-                    &WorkspaceCache::default(),
-                )
-                .await?
-                .with_current_project(package.clone())
-                .with_context(|| format!("Package `{package}` not found in workspace"))?,
+            VirtualProject::discover_with_package(
+                project_dir,
+                &DiscoveryOptions::default(),
+                &WorkspaceCache::default(),
+                package.clone(),
             )
+            .await?
         } else {
             VirtualProject::discover(
                 project_dir,
@@ -126,10 +124,12 @@ pub(crate) async fn remove(
             DependencyType::Production => {
                 let deps = toml.remove_dependency(&package)?;
                 if deps.is_empty() {
-                    show_other_dependency_type_hint(printer, &package, &toml)?;
-                    anyhow::bail!(
-                        "The dependency `{package}` could not be found in `project.dependencies`"
-                    )
+                    return Err(DependencyNotFoundError {
+                        package: package.clone(),
+                        dependency_type: dependency_type.clone(),
+                        found_in: toml.find_dependency(&package, None),
+                    }
+                    .into());
                 }
             }
             DependencyType::Dev => {
@@ -137,19 +137,23 @@ pub(crate) async fn remove(
                 let group_deps =
                     toml.remove_dependency_group_requirement(&package, &DEV_DEPENDENCIES)?;
                 if dev_deps.is_empty() && group_deps.is_empty() {
-                    show_other_dependency_type_hint(printer, &package, &toml)?;
-                    anyhow::bail!(
-                        "The dependency `{package}` could not be found in `tool.uv.dev-dependencies` or `tool.uv.dependency-groups.dev`"
-                    );
+                    return Err(DependencyNotFoundError {
+                        package: package.clone(),
+                        dependency_type: dependency_type.clone(),
+                        found_in: toml.find_dependency(&package, None),
+                    }
+                    .into());
                 }
             }
             DependencyType::Optional(ref extra) => {
                 let deps = toml.remove_optional_dependency(&package, extra)?;
                 if deps.is_empty() {
-                    show_other_dependency_type_hint(printer, &package, &toml)?;
-                    anyhow::bail!(
-                        "The dependency `{package}` could not be found in `project.optional-dependencies.{extra}`"
-                    );
+                    return Err(DependencyNotFoundError {
+                        package: package.clone(),
+                        dependency_type: dependency_type.clone(),
+                        found_in: toml.find_dependency(&package, None),
+                    }
+                    .into());
                 }
             }
             DependencyType::Group(ref group) => {
@@ -158,18 +162,22 @@ pub(crate) async fn remove(
                     let group_deps =
                         toml.remove_dependency_group_requirement(&package, &DEV_DEPENDENCIES)?;
                     if dev_deps.is_empty() && group_deps.is_empty() {
-                        show_other_dependency_type_hint(printer, &package, &toml)?;
-                        anyhow::bail!(
-                            "The dependency `{package}` could not be found in `tool.uv.dev-dependencies` or `tool.uv.dependency-groups.dev`"
-                        );
+                        return Err(DependencyNotFoundError {
+                            package: package.clone(),
+                            dependency_type: dependency_type.clone(),
+                            found_in: toml.find_dependency(&package, None),
+                        }
+                        .into());
                     }
                 } else {
                     let deps = toml.remove_dependency_group_requirement(&package, group)?;
                     if deps.is_empty() {
-                        show_other_dependency_type_hint(printer, &package, &toml)?;
-                        anyhow::bail!(
-                            "The dependency `{package}` could not be found in `dependency-groups.{group}`"
-                        );
+                        return Err(DependencyNotFoundError {
+                            package: package.clone(),
+                            dependency_type: dependency_type.clone(),
+                            found_in: toml.find_dependency(&package, None),
+                        }
+                        .into());
                     }
                 }
             }
@@ -183,7 +191,7 @@ pub(crate) async fn remove(
 
     // If `--frozen`, exit early. There's no reason to lock and sync, since we don't need a `uv.lock`
     // to exist at all.
-    if frozen {
+    if frozen.is_some() {
         return Ok(ExitStatus::Success);
     }
 
@@ -215,17 +223,23 @@ pub(crate) async fn remove(
         RemoveTarget::Project(project) => {
             if no_sync {
                 // Discover the interpreter.
+                let workspace_python = WorkspacePython::from_request(
+                    python.as_deref().map(PythonRequest::parse),
+                    Some(project.workspace()),
+                    &groups,
+                    project_dir,
+                    no_config,
+                )
+                .await?;
                 let interpreter = ProjectInterpreter::discover(
                     project.workspace(),
-                    project_dir,
                     &groups,
-                    python.as_deref().map(PythonRequest::parse),
-                    &network_settings,
+                    workspace_python,
+                    &client_builder,
                     python_preference,
                     python_downloads,
                     &install_mirrors,
                     false,
-                    no_config,
                     active,
                     cache,
                     printer,
@@ -242,7 +256,7 @@ pub(crate) async fn remove(
                     &groups,
                     python.as_deref().map(PythonRequest::parse),
                     &install_mirrors,
-                    &network_settings,
+                    &client_builder,
                     python_preference,
                     python_downloads,
                     no_sync,
@@ -263,7 +277,7 @@ pub(crate) async fn remove(
             let interpreter = ScriptInterpreter::discover(
                 (&script).into(),
                 python.as_deref().map(PythonRequest::parse),
-                &network_settings,
+                &client_builder,
                 python_preference,
                 python_downloads,
                 &install_mirrors,
@@ -290,8 +304,8 @@ pub(crate) async fn remove(
         .ok();
 
     // Determine the lock mode.
-    let mode = if locked {
-        LockMode::Locked(target.interpreter())
+    let mode = if let LockCheck::Enabled(lock_check) = lock_check {
+        LockMode::Locked(target.interpreter(), lock_check)
     } else {
         LockMode::Write(target.interpreter())
     };
@@ -300,26 +314,30 @@ pub(crate) async fn remove(
     let state = UniversalState::default();
 
     // Lock and sync the environment, if necessary.
-    let lock = match project::lock::LockOperation::new(
-        mode,
-        &settings.resolver,
-        &network_settings,
-        &state,
-        Box::new(DefaultResolveLogger),
-        concurrency,
-        cache,
-        &WorkspaceCache::default(),
-        printer,
-        preview,
+    let lock = match Box::pin(
+        project::lock::LockOperation::new(
+            mode,
+            &settings.resolver,
+            &client_builder,
+            &state,
+            Box::new(DefaultResolveLogger),
+            &concurrency,
+            cache,
+            &WorkspaceCache::default(),
+            printer,
+            preview,
+        )
+        .execute((&target).into()),
     )
-    .execute((&target).into())
     .await
     {
         Ok(result) => result.into_lock(),
         Err(ProjectError::Operation(err)) => {
-            return diagnostics::OperationDiagnostic::native_tls(network_settings.native_tls)
-                .report(err)
-                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
+            return diagnostics::OperationDiagnostic::with_system_certs(
+                client_builder.system_certs(),
+            )
+            .report(err)
+            .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
         }
         Err(err) => return Err(err.into()),
     };
@@ -354,29 +372,32 @@ pub(crate) async fn remove(
         venv,
         &extras,
         &groups,
-        EditableMode::Editable,
+        None,
         InstallOptions::default(),
         Modifications::Exact,
         None,
         (&settings).into(),
-        &network_settings,
+        &client_builder,
         &state,
         Box::new(DefaultInstallLogger),
         installer_metadata,
-        concurrency,
+        &concurrency,
         cache,
-        WorkspaceCache::default(),
+        &WorkspaceCache::default(),
         DryRun::Disabled,
         printer,
         preview,
+        &malware_settings,
     )
     .await
     {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(ProjectError::Operation(err)) => {
-            return diagnostics::OperationDiagnostic::native_tls(network_settings.native_tls)
-                .report(err)
-                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
+            return diagnostics::OperationDiagnostic::with_system_certs(
+                client_builder.system_certs(),
+            )
+            .report(err)
+            .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
         }
         Err(err) => return Err(err.into()),
     }
@@ -386,7 +407,7 @@ pub(crate) async fn remove(
 
 /// Represents the destination where dependencies are added, either to a project or a script.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 enum RemoveTarget {
     /// A PEP 723 script, with inline metadata.
     Project(VirtualProject),
@@ -423,7 +444,6 @@ impl RemoveTarget {
     }
 
     /// Update the target in-memory to incorporate the new content.
-    #[allow(clippy::result_large_err)]
     fn update(self, content: &str) -> Result<Self, ProjectError> {
         match self {
             Self::Script(mut script) => {
@@ -432,10 +452,12 @@ impl RemoveTarget {
                 Ok(Self::Script(script))
             }
             Self::Project(project) => {
+                let pyproject_path = project.root().join("pyproject.toml");
                 let project = project
-                    .with_pyproject_toml(
-                        toml::from_str(content).map_err(ProjectError::PyprojectTomlParse)?,
-                    )
+                    .update_member(
+                        PyProjectToml::from_string(content.to_string(), &pyproject_path)
+                            .map_err(ProjectError::PyprojectTomlParse)?,
+                    )?
                     .ok_or(ProjectError::PyprojectTomlUpdate)?;
                 Ok(Self::Project(project))
             }
@@ -443,48 +465,46 @@ impl RemoveTarget {
     }
 }
 
-/// Show a hint if a dependency with the given name is present as any dependency type.
-///
-/// This is useful when a dependency of the user-specified type was not found, but it may be present
-/// elsewhere.
-fn show_other_dependency_type_hint(
-    printer: Printer,
-    name: &PackageName,
-    pyproject: &PyProjectTomlMut,
-) -> Result<()> {
-    // TODO(zanieb): Attach these hints to the error so they render _after_ in accordance our
-    // typical styling
-    for dep_ty in pyproject.find_dependency(name, None) {
-        match dep_ty {
-            DependencyType::Production => writeln!(
-                printer.stderr(),
-                "{}{} `{name}` is a production dependency",
-                "hint".bold().cyan(),
-                ":".bold(),
-            )?,
-            DependencyType::Dev => writeln!(
-                printer.stderr(),
-                "{}{} `{name}` is a development dependency (try: `{}`)",
-                "hint".bold().cyan(),
-                ":".bold(),
-                format!("uv remove {name} --dev`").bold()
-            )?,
-            DependencyType::Optional(group) => writeln!(
-                printer.stderr(),
-                "{}{} `{name}` is an optional dependency (try: `{}`)",
-                "hint".bold().cyan(),
-                ":".bold(),
-                format!("uv remove {name} --optional {group}").bold()
-            )?,
-            DependencyType::Group(group) => writeln!(
-                printer.stderr(),
-                "{}{} `{name}` is in the `{group}` group (try: `{}`)",
-                "hint".bold().cyan(),
-                ":".bold(),
-                format!("uv remove {name} --group {group}").bold()
-            )?,
-        }
-    }
+/// A dependency was not found in the expected dependency type, but may exist elsewhere.
+#[derive(Debug, thiserror::Error)]
+#[error("The dependency `{package}` could not be found in {}", dependency_type.toml_table_name())]
+pub(crate) struct DependencyNotFoundError {
+    pub(crate) package: PackageName,
+    pub(crate) dependency_type: DependencyType,
+    /// Other dependency types where this package was found.
+    pub(crate) found_in: Vec<DependencyType>,
+}
 
-    Ok(())
+impl uv_errors::Hint for DependencyNotFoundError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        self.found_in
+            .iter()
+            .map(|dep_ty| match dep_ty {
+                DependencyType::Production => {
+                    format!("`{}` is a production dependency", self.package)
+                }
+                DependencyType::Dev => {
+                    format!(
+                        "`{}` is a development dependency (try: `{}`)",
+                        self.package,
+                        format!("uv remove {} --dev", self.package).bold(),
+                    )
+                }
+                DependencyType::Optional(group) => {
+                    format!(
+                        "`{}` is an optional dependency (try: `{}`)",
+                        self.package,
+                        format!("uv remove {} --optional {group}", self.package).bold(),
+                    )
+                }
+                DependencyType::Group(group) => {
+                    format!(
+                        "`{}` is in the `{group}` group (try: `{}`)",
+                        self.package,
+                        format!("uv remove {} --group {group}", self.package).bold(),
+                    )
+                }
+            })
+            .collect()
+    }
 }

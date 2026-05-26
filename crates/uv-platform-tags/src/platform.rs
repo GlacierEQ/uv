@@ -5,12 +5,26 @@ use std::{fmt, io};
 
 use thiserror::Error;
 
+use crate::ParseReleaseArchError;
+
 #[derive(Error, Debug)]
 pub enum PlatformError {
     #[error(transparent)]
     IOError(#[from] io::Error),
     #[error("Failed to detect the operating system version: {0}")]
     OsVersionDetectionError(String),
+    #[error("Invalid platform release and architecture `{release_arch}`: {error}")]
+    InvalidReleaseArch {
+        release_arch: String,
+        #[source]
+        error: ParseReleaseArchError,
+    },
+    #[error("Invalid Android architecture: {0}")]
+    InvalidAndroidArch(Arch),
+    #[error("Invalid iOS simulator architecture: {0}")]
+    InvalidIosSimulatorArch(Arch),
+    #[error("Invalid iOS device architecture: {0}")]
+    InvalidIosDeviceArch(Arch),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -34,24 +48,75 @@ impl Platform {
     pub fn arch(&self) -> Arch {
         self.arch
     }
+
+    /// Return a human-readable representation of the platform.
+    pub fn pretty(&self) -> String {
+        let os = match self.os() {
+            Os::Manylinux { .. } | Os::Musllinux { .. } => "Linux",
+            Os::Windows => "Windows",
+            Os::Pyodide { .. } => "Pyodide",
+            Os::Macos { .. } => "macOS",
+            Os::FreeBsd { .. } => "FreeBSD",
+            Os::NetBsd { .. } => "NetBSD",
+            Os::OpenBsd { .. } => "OpenBSD",
+            Os::Dragonfly { .. } => "DragonFly",
+            Os::Illumos { .. } => "Illumos",
+            Os::Haiku { .. } => "Haiku",
+            Os::Android { .. } => "Android",
+            Os::Ios { .. } => "iOS",
+        };
+        format!("{os} {}", self.arch())
+    }
 }
 
 /// All supported operating systems.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "name", rename_all = "lowercase")]
 pub enum Os {
-    Manylinux { major: u16, minor: u16 },
-    Musllinux { major: u16, minor: u16 },
+    Manylinux {
+        major: u16,
+        minor: u16,
+    },
+    Musllinux {
+        major: u16,
+        minor: u16,
+    },
     Windows,
-    Pyodide { major: u16, minor: u16 },
-    Macos { major: u16, minor: u16 },
-    FreeBsd { release: String },
-    NetBsd { release: String },
-    OpenBsd { release: String },
-    Dragonfly { release: String },
-    Illumos { release: String, arch: String },
-    Haiku { release: String },
-    Android { api_level: u16 },
+    Pyodide {
+        major: u16,
+        minor: u16,
+    },
+    Macos {
+        major: u16,
+        minor: u16,
+    },
+    FreeBsd {
+        release: String,
+    },
+    NetBsd {
+        release: String,
+    },
+    OpenBsd {
+        release: String,
+    },
+    Dragonfly {
+        release: String,
+    },
+    Illumos {
+        release: String,
+        arch: String,
+    },
+    Haiku {
+        release: String,
+    },
+    Android {
+        api_level: u16,
+    },
+    Ios {
+        major: u16,
+        minor: u16,
+        simulator: bool,
+    },
 }
 
 impl fmt::Display for Os {
@@ -69,6 +134,7 @@ impl fmt::Display for Os {
             Self::Haiku { .. } => write!(f, "haiku"),
             Self::Android { .. } => write!(f, "android"),
             Self::Pyodide { .. } => write!(f, "pyodide"),
+            Self::Ios { .. } => write!(f, "ios"),
         }
     }
 }
@@ -116,21 +182,7 @@ pub enum Arch {
 
 impl fmt::Display for Arch {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Self::Aarch64 => write!(f, "aarch64"),
-            Self::Armv5TEL => write!(f, "armv5tel"),
-            Self::Armv6L => write!(f, "armv6l"),
-            Self::Armv7L => write!(f, "armv7l"),
-            Self::Powerpc64Le => write!(f, "ppc64le"),
-            Self::Powerpc64 => write!(f, "ppc64"),
-            Self::Powerpc => write!(f, "ppc"),
-            Self::X86 => write!(f, "i686"),
-            Self::X86_64 => write!(f, "x86_64"),
-            Self::S390X => write!(f, "s390x"),
-            Self::LoongArch64 => write!(f, "loongarch64"),
-            Self::Riscv64 => write!(f, "riscv64"),
-            Self::Wasm32 => write!(f, "wasm32"),
-        }
+        write!(f, "{}", self.name())
     }
 }
 
@@ -142,7 +194,8 @@ impl FromStr for Arch {
             "aarch64" => Ok(Self::Aarch64),
             "armv5tel" => Ok(Self::Armv5TEL),
             "armv6l" => Ok(Self::Armv6L),
-            "armv7l" => Ok(Self::Armv7L),
+            // armv8l is 32-bit ARM running on ARMv8 hardware, compatible with armv7l
+            "armv7l" | "armv8l" => Ok(Self::Armv7L),
             "ppc64le" => Ok(Self::Powerpc64Le),
             "ppc64" => Ok(Self::Powerpc64),
             "ppc" => Ok(Self::Powerpc),
@@ -159,7 +212,7 @@ impl FromStr for Arch {
 impl Arch {
     /// Returns the oldest possible `manylinux` tag for this architecture, if it supports
     /// `manylinux`.
-    pub fn get_minimum_manylinux_minor(&self) -> Option<u16> {
+    pub(crate) fn get_minimum_manylinux_minor(self) -> Option<u16> {
         match self {
             // manylinux 2014
             Self::Aarch64 | Self::Armv7L | Self::Powerpc64 | Self::Powerpc64Le | Self::S390X => {
@@ -176,7 +229,7 @@ impl Arch {
         }
     }
 
-    /// Returns the canonical name of the architecture.
+    /// Returns the standard name of the architecture.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Aarch64 => "aarch64",
@@ -195,23 +248,53 @@ impl Arch {
         }
     }
 
-    /// Returns an iterator over all supported architectures.
-    pub fn iter() -> impl Iterator<Item = Self> {
-        [
-            Self::Aarch64,
-            Self::Armv5TEL,
-            Self::Armv6L,
-            Self::Armv7L,
-            Self::Powerpc64Le,
-            Self::Powerpc64,
-            Self::Powerpc,
-            Self::X86,
-            Self::X86_64,
-            Self::S390X,
-            Self::LoongArch64,
-            Self::Riscv64,
-        ]
-        .iter()
-        .copied()
+    /// Represents the hardware platform.
+    ///
+    /// This is the same as the native platform's `uname -m` output.
+    ///
+    /// Based on: <https://github.com/PyO3/maturin/blob/8ab42219247277fee513eac753a3e90e76cd46b9/src/target/mod.rs#L131>
+    pub fn machine(&self) -> &'static str {
+        match self {
+            Self::Aarch64 => "arm64",
+            Self::Armv5TEL | Self::Armv6L | Self::Armv7L => "arm",
+            Self::Powerpc | Self::Powerpc64Le | Self::Powerpc64 => "powerpc",
+            Self::X86 => "i386",
+            Self::X86_64 => "amd64",
+            Self::Riscv64 => "riscv",
+            Self::Wasm32 => "wasm32",
+            Self::S390X => "s390x",
+            Self::LoongArch64 => "loongarch64",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arch, Os, Platform};
+
+    #[test]
+    fn platform_pretty_macos() {
+        let platform = Platform::new(
+            Os::Macos {
+                major: 11,
+                minor: 0,
+            },
+            Arch::Aarch64,
+        );
+
+        assert_eq!(platform.pretty(), "macOS aarch64");
+    }
+
+    #[test]
+    fn platform_pretty_manylinux() {
+        let platform = Platform::new(
+            Os::Manylinux {
+                major: 2,
+                minor: 28,
+            },
+            Arch::X86_64,
+        );
+
+        assert_eq!(platform.pretty(), "Linux x86_64");
     }
 }

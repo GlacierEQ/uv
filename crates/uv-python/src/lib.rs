@@ -1,5 +1,4 @@
 //! Find requested Python interpreters and query interpreters for information.
-use owo_colors::OwoColorize;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -8,7 +7,7 @@ use uv_static::EnvVars;
 pub use crate::discovery::{
     EnvironmentPreference, Error as DiscoveryError, PythonDownloads, PythonNotFound,
     PythonPreference, PythonRequest, PythonSource, PythonVariant, VersionRequest,
-    find_python_installations, satisfies_python_preference,
+    find_python_installations,
 };
 pub use crate::downloads::PlatformRequest;
 pub use crate::environment::{InvalidEnvironmentKind, PythonEnvironment};
@@ -17,11 +16,11 @@ pub use crate::installation::{
     PythonInstallation, PythonInstallationKey, PythonInstallationMinorVersionKey,
 };
 pub use crate::interpreter::{
-    BrokenSymlink, Error as InterpreterError, Interpreter, canonicalize_executable,
+    BrokenLink, Error as InterpreterError, Interpreter, canonicalize_executable,
 };
 pub use crate::pointer_size::PointerSize;
 pub use crate::prefix::Prefix;
-pub use crate::python_version::PythonVersion;
+pub use crate::python_version::{BuildVersionError, PythonVersion};
 pub use crate::target::Target;
 pub use crate::version_files::{
     DiscoveryOptions as VersionFileDiscoveryOptions, FilePreference as VersionFilePreference,
@@ -87,24 +86,106 @@ pub enum Error {
     #[error(transparent)]
     Download(#[from] downloads::Error),
 
+    #[error(transparent)]
+    ClientBuild(#[from] uv_client::ClientBuildError),
+
     // TODO(zanieb) We might want to ensure this is always wrapped in another type
     #[error(transparent)]
     KeyError(#[from] installation::PythonInstallationKeyError),
 
-    #[error("{}{}", .0, if let Some(hint) = .1 { format!("\n\n{}{} {hint}", "hint".bold().cyan(), ":".bold()) } else { String::new() })]
-    MissingPython(PythonNotFound, Option<String>),
+    #[error("{}", .0)]
+    MissingPython(PythonNotFound, Option<Box<MissingPythonHint>>),
 
     #[error(transparent)]
     MissingEnvironment(#[from] environment::EnvironmentNotFound),
 
     #[error(transparent)]
     InvalidEnvironment(#[from] environment::InvalidEnvironment),
+
+    #[error(transparent)]
+    RetryParsing(#[from] uv_client::RetryParsingError),
+}
+
+/// The reason a managed Python download could not be used.
+#[derive(Debug)]
+pub enum MissingPythonHint {
+    /// uv's embedded download metadata may be stale.
+    RequiresUpdate,
+    /// Downloads are set to `manual`.
+    DownloadsManual(PythonRequest),
+    /// Downloads are set to `never`.
+    DownloadsNever(PythonRequest),
+    /// Python preference is set to `only-system`.
+    PreferenceOnlySystem(PythonRequest),
+    /// uv is in offline mode.
+    Offline(PythonRequest),
+}
+
+impl MissingPythonHint {
+    fn for_request(request: &PythonRequest) -> String {
+        match request {
+            PythonRequest::Default | PythonRequest::Any => String::new(),
+            _ => format!(" for {request}"),
+        }
+    }
+}
+
+impl std::fmt::Display for MissingPythonHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequiresUpdate => {
+                write!(
+                    f,
+                    "uv embeds available Python downloads and may require an update to install new versions. Consider retrying on a newer version of uv."
+                )
+            }
+            Self::DownloadsManual(request) => {
+                write!(
+                    f,
+                    "A managed Python download is available{}, but Python downloads are set to 'manual', use `uv python install {}` to install the required version",
+                    Self::for_request(request),
+                    request.to_canonical_string(),
+                )
+            }
+            Self::DownloadsNever(request) => {
+                write!(
+                    f,
+                    "A managed Python download is available{}, but Python downloads are set to 'never'",
+                    Self::for_request(request),
+                )
+            }
+            Self::PreferenceOnlySystem(request) => {
+                write!(
+                    f,
+                    "A managed Python download is available{}, but the Python preference is set to 'only system'",
+                    Self::for_request(request),
+                )
+            }
+            Self::Offline(request) => {
+                write!(
+                    f,
+                    "A managed Python download is available{}, but uv is set to offline mode",
+                    Self::for_request(request),
+                )
+            }
+        }
+    }
+}
+
+impl uv_errors::Hint for Error {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        match self {
+            Self::MissingPython(_, Some(hint)) => uv_errors::Hints::from(hint.to_string()),
+            Self::Discovery(err) => err.hints(),
+            _ => uv_errors::Hints::none(),
+        }
+    }
 }
 
 impl Error {
-    pub(crate) fn with_missing_python_hint(self, hint: String) -> Self {
+    pub(crate) fn with_hint(self, hint: MissingPythonHint) -> Self {
         match self {
-            Self::MissingPython(err, _) => Self::MissingPython(err, Some(hint)),
+            Self::MissingPython(err, _) => Self::MissingPython(err, Some(Box::new(hint))),
             _ => self,
         }
     }
@@ -132,13 +213,14 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use temp_env::with_vars;
     use test_log::test;
-    use uv_configuration::Preview;
+    use uv_client::BaseClientBuilder;
+    use uv_preview::{Preview, PreviewFeature};
     use uv_static::EnvVars;
 
     use uv_cache::Cache;
 
     use crate::{
-        PythonNotFound, PythonRequest, PythonSource, PythonVersion,
+        PythonDownloads, PythonNotFound, PythonRequest, PythonSource, PythonVersion,
         implementation::ImplementationName, installation::PythonInstallation,
         managed::ManagedPythonInstallations, virtualenv::virtualenv_python_executable,
     };
@@ -211,7 +293,9 @@ mod tests {
 
             let mut run_vars = vec![
                 // Ensure `PATH` is used
-                (EnvVars::UV_TEST_PYTHON_PATH, None),
+                (EnvVars::UV_PYTHON_SEARCH_PATH, None),
+                // Keep discovery hermetic by disabling registry-based sources unless a test opts in.
+                (EnvVars::UV_PYTHON_NO_REGISTRY, Some(OsStr::new("1"))),
                 // Ignore active virtual environments (i.e. that the dev is using)
                 (EnvVars::VIRTUAL_ENV, None),
                 (EnvVars::PATH, path.as_deref()),
@@ -221,7 +305,7 @@ mod tests {
                     Some(self.installations.root().as_os_str()),
                 ),
                 // Set a working directory
-                ("PWD", Some(self.workdir.path().as_os_str())),
+                (EnvVars::PWD, Some(self.workdir.path().as_os_str())),
             ];
             for (key, value) in vars {
                 run_vars.push((key, *value));
@@ -291,7 +375,8 @@ mod tests {
                         "scripts": "bin"
                     },
                     "pointer_size": "64",
-                    "gil_disabled": {FREE_THREADED}
+                    "gil_disabled": {FREE_THREADED},
+                    "debug_enabled": false
                 }
             "##};
 
@@ -307,7 +392,10 @@ mod tests {
                     path.to_str().expect("Path can be represented as string"),
                 )
                 .replace("{FULL_VERSION}", &version.to_string())
-                .replace("{VERSION}", &version.without_patch().to_string())
+                .replace(
+                    "{VERSION}",
+                    &format!("{}.{}", version.major(), version.minor()),
+                )
                 .replace("{FREE_THREADED}", &free_threaded.to_string())
                 .replace("{IMPLEMENTATION}", (&implementation).into());
 
@@ -382,7 +470,8 @@ mod tests {
                         "data": ""
                     },
                     "pointer_size": "32",
-                    "gil_disabled": false
+                    "gil_disabled": false,
+                    "debug_enabled": false
                 }
             "##};
 
@@ -392,7 +481,10 @@ mod tests {
                     path.to_str().expect("Path can be represented as string"),
                 )
                 .replace("{FULL_VERSION}", &version.to_string())
-                .replace("{VERSION}", &version.without_patch().to_string());
+                .replace(
+                    "{VERSION}",
+                    &format!("{}.{}", version.major(), version.minor()),
+                );
 
             fs_err::create_dir_all(path.parent().unwrap())?;
             fs_err::write(
@@ -606,7 +698,7 @@ mod tests {
         });
         assert!(
             matches!(result, Ok(Err(PythonNotFound { .. }))),
-            "With an non-executable Python, no Python installation should be detected; got {result:?}"
+            "With a non-executable Python, no Python installation should be detected; got {result:?}"
         );
 
         Ok(())
@@ -635,6 +727,54 @@ mod tests {
                 }
             ),
             "We should find the valid executable; got {interpreter:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn find_or_download_skips_download_metadata_when_python_is_found() -> Result<()> {
+        let mut context = TestContext::new()?;
+        context.add_python_versions(&["3.12.1"])?;
+        // Pass a missing metadata file to assert that an already-installed Python can
+        // be returned without reading the download list.
+        let missing_downloads = context.tempdir.child("missing-downloads.json");
+
+        let interpreter = context.run(|| {
+            let client_builder = BaseClientBuilder::default();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build runtime")
+                .block_on(PythonInstallation::find_or_download(
+                    None,
+                    EnvironmentPreference::OnlySystem,
+                    PythonPreference::OnlySystem,
+                    PythonDownloads::Never,
+                    &client_builder,
+                    &context.cache,
+                    None,
+                    None,
+                    None,
+                    missing_downloads.path().to_str(),
+                    Preview::default(),
+                ))
+        })?;
+
+        assert!(
+            matches!(
+                interpreter,
+                PythonInstallation {
+                    source: PythonSource::SearchPathFirst,
+                    interpreter: _
+                }
+            ),
+            "We should find the local Python without reading download metadata; got {interpreter:?}"
+        );
+        assert_eq!(
+            &interpreter.interpreter().python_full_version().to_string(),
+            "3.12.1",
+            "We should find the local interpreter"
         );
 
         Ok(())
@@ -984,20 +1124,47 @@ mod tests {
         Ok(())
     }
 
+    fn find_best_python_installation_no_download(
+        request: &PythonRequest,
+        environments: EnvironmentPreference,
+        preference: PythonPreference,
+        cache: &Cache,
+        preview: Preview,
+    ) -> Result<PythonInstallation, crate::Error> {
+        let client_builder = BaseClientBuilder::default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build runtime")
+            .block_on(find_best_python_installation(
+                request,
+                environments,
+                preference,
+                false,
+                &client_builder,
+                cache,
+                None,
+                None,
+                None,
+                None,
+                preview,
+            ))
+    }
+
     #[test]
     fn find_best_python_version_patch_exact() -> Result<()> {
         let mut context = TestContext::new()?;
         context.add_python_versions(&["3.10.1", "3.11.2", "3.11.4", "3.11.3", "3.12.5"])?;
 
         let python = context.run(|| {
-            find_best_python_installation(
+            find_best_python_installation_no_download(
                 &PythonRequest::parse("3.11.3"),
                 EnvironmentPreference::Any,
                 PythonPreference::OnlySystem,
                 &context.cache,
                 Preview::default(),
             )
-        })??;
+        })?;
 
         assert!(
             matches!(
@@ -1024,14 +1191,14 @@ mod tests {
         context.add_python_versions(&["3.10.1", "3.11.2", "3.11.4", "3.11.3", "3.12.5"])?;
 
         let python = context.run(|| {
-            find_best_python_installation(
+            find_best_python_installation_no_download(
                 &PythonRequest::parse("3.11.11"),
                 EnvironmentPreference::Any,
                 PythonPreference::OnlySystem,
                 &context.cache,
                 Preview::default(),
             )
-        })??;
+        })?;
 
         assert!(
             matches!(
@@ -1061,14 +1228,14 @@ mod tests {
 
         let python =
             context.run_with_vars(&[(EnvVars::VIRTUAL_ENV, Some(venv.as_os_str()))], || {
-                find_best_python_installation(
+                find_best_python_installation_no_download(
                     &PythonRequest::parse("3.10"),
                     EnvironmentPreference::Any,
                     PythonPreference::OnlySystem,
                     &context.cache,
                     Preview::default(),
                 )
-            })??;
+            })?;
         assert!(
             matches!(
                 python,
@@ -1092,14 +1259,14 @@ mod tests {
 
         let python =
             context.run_with_vars(&[(EnvVars::VIRTUAL_ENV, Some(venv.as_os_str()))], || {
-                find_best_python_installation(
+                find_best_python_installation_no_download(
                     &PythonRequest::parse("3.10.2"),
                     EnvironmentPreference::Any,
                     PythonPreference::OnlySystem,
                     &context.cache,
                     Preview::default(),
                 )
-            })??;
+            })?;
         assert!(
             matches!(
                 python,
@@ -1176,33 +1343,36 @@ mod tests {
         let condaenv = context.tempdir.child("condaenv");
         TestContext::mock_conda_prefix(&condaenv, "3.12.0")?;
 
-        let python = context.run_with_vars(
-            &[(EnvVars::CONDA_PREFIX, Some(condaenv.as_os_str()))],
-            || {
-                // Note this python is not treated as a system interpreter
-                find_python_installation(
-                    &PythonRequest::Default,
-                    EnvironmentPreference::OnlyVirtual,
-                    PythonPreference::OnlySystem,
-                    &context.cache,
-                    Preview::default(),
-                )
-            },
-        )??;
+        let python = context
+            .run_with_vars(
+                &[(EnvVars::CONDA_PREFIX, Some(condaenv.as_os_str()))],
+                || {
+                    // Note this python is not treated as a system interpreter
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlyVirtual,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::default(),
+                    )
+                },
+            )?
+            .unwrap();
         assert_eq!(
             python.interpreter().python_full_version().to_string(),
             "3.12.0",
             "We should allow the active conda python"
         );
 
-        let baseenv = context.tempdir.child("base");
+        let baseenv = context.tempdir.child("conda");
         TestContext::mock_conda_prefix(&baseenv, "3.12.1")?;
 
         // But not if it's a base environment
         let result = context.run_with_vars(
             &[
-                ("CONDA_PREFIX", Some(baseenv.as_os_str())),
-                ("CONDA_DEFAULT_ENV", Some(&OsString::from("base"))),
+                (EnvVars::CONDA_PREFIX, Some(baseenv.as_os_str())),
+                (EnvVars::CONDA_DEFAULT_ENV, Some(&OsString::from("base"))),
+                (EnvVars::CONDA_ROOT, None),
             ],
             || {
                 find_python_installation(
@@ -1221,21 +1391,24 @@ mod tests {
         );
 
         // Unless, system interpreters are included...
-        let python = context.run_with_vars(
-            &[
-                ("CONDA_PREFIX", Some(baseenv.as_os_str())),
-                ("CONDA_DEFAULT_ENV", Some(&OsString::from("base"))),
-            ],
-            || {
-                find_python_installation(
-                    &PythonRequest::Default,
-                    EnvironmentPreference::OnlySystem,
-                    PythonPreference::OnlySystem,
-                    &context.cache,
-                    Preview::default(),
-                )
-            },
-        )??;
+        let python = context
+            .run_with_vars(
+                &[
+                    (EnvVars::CONDA_PREFIX, Some(baseenv.as_os_str())),
+                    (EnvVars::CONDA_DEFAULT_ENV, Some(&OsString::from("base"))),
+                    (EnvVars::CONDA_ROOT, None),
+                ],
+                || {
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlySystem,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::default(),
+                    )
+                },
+            )?
+            .unwrap();
 
         assert_eq!(
             python.interpreter().python_full_version().to_string(),
@@ -1244,10 +1417,186 @@ mod tests {
         );
 
         // If the environment name doesn't match the default, we should not treat it as system
+        let python = context
+            .run_with_vars(
+                &[
+                    (EnvVars::CONDA_PREFIX, Some(condaenv.as_os_str())),
+                    (
+                        EnvVars::CONDA_DEFAULT_ENV,
+                        Some(&OsString::from("condaenv")),
+                    ),
+                ],
+                || {
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlyVirtual,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::default(),
+                    )
+                },
+            )?
+            .unwrap();
+
+        assert_eq!(
+            python.interpreter().python_full_version().to_string(),
+            "3.12.0",
+            "We should find the conda environment when name matches"
+        );
+
+        // When CONDA_DEFAULT_ENV is "base", it should always be treated as base environment
+        let result = context.run_with_vars(
+            &[
+                (EnvVars::CONDA_PREFIX, Some(condaenv.as_os_str())),
+                (EnvVars::CONDA_DEFAULT_ENV, Some(&OsString::from("base"))),
+            ],
+            || {
+                find_python_installation(
+                    &PythonRequest::Default,
+                    EnvironmentPreference::OnlyVirtual,
+                    PythonPreference::OnlySystem,
+                    &context.cache,
+                    Preview::default(),
+                )
+            },
+        )?;
+
+        assert!(
+            matches!(result, Err(PythonNotFound { .. })),
+            "We should not allow the base environment when looking for virtual environments"
+        );
+
+        // With the `special-conda-env-names` preview feature, "base" is not special-cased
+        // and uses path-based heuristics instead. When the directory name matches the env name,
+        // it should be treated as a child environment.
+        let base_dir = context.tempdir.child("base");
+        TestContext::mock_conda_prefix(&base_dir, "3.12.6")?;
+        let python = context
+            .run_with_vars(
+                &[
+                    (EnvVars::CONDA_PREFIX, Some(base_dir.as_os_str())),
+                    (EnvVars::CONDA_DEFAULT_ENV, Some(&OsString::from("base"))),
+                    (EnvVars::CONDA_ROOT, None),
+                ],
+                || {
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlyVirtual,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::new(&[PreviewFeature::SpecialCondaEnvNames]),
+                    )
+                },
+            )?
+            .unwrap();
+
+        assert_eq!(
+            python.interpreter().python_full_version().to_string(),
+            "3.12.6",
+            "With special-conda-env-names preview, 'base' named env in matching dir should be treated as child"
+        );
+
+        // When environment name matches directory name, it should be treated as a child environment
+        let myenv_dir = context.tempdir.child("myenv");
+        TestContext::mock_conda_prefix(&myenv_dir, "3.12.5")?;
+        let python = context
+            .run_with_vars(
+                &[
+                    (EnvVars::CONDA_PREFIX, Some(myenv_dir.as_os_str())),
+                    (EnvVars::CONDA_DEFAULT_ENV, Some(&OsString::from("myenv"))),
+                ],
+                || {
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlyVirtual,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::default(),
+                    )
+                },
+            )?
+            .unwrap();
+
+        assert_eq!(
+            python.interpreter().python_full_version().to_string(),
+            "3.12.5",
+            "We should find the child conda environment"
+        );
+
+        // Test _CONDA_ROOT detection of base environment
+        let conda_root_env = context.tempdir.child("conda-root");
+        TestContext::mock_conda_prefix(&conda_root_env, "3.12.2")?;
+
+        // When _CONDA_ROOT matches CONDA_PREFIX, it should be treated as a base environment
+        let result = context.run_with_vars(
+            &[
+                (EnvVars::CONDA_PREFIX, Some(conda_root_env.as_os_str())),
+                (EnvVars::CONDA_ROOT, Some(conda_root_env.as_os_str())),
+                (
+                    EnvVars::CONDA_DEFAULT_ENV,
+                    Some(&OsString::from("custom-name")),
+                ),
+            ],
+            || {
+                find_python_installation(
+                    &PythonRequest::Default,
+                    EnvironmentPreference::OnlyVirtual,
+                    PythonPreference::OnlySystem,
+                    &context.cache,
+                    Preview::default(),
+                )
+            },
+        )?;
+
+        assert!(
+            matches!(result, Err(PythonNotFound { .. })),
+            "Base environment detected via _CONDA_ROOT should be excluded from virtual environments; got {result:?}"
+        );
+
+        // When _CONDA_ROOT doesn't match CONDA_PREFIX, it should be treated as a regular conda environment
+        let other_conda_env = context.tempdir.child("other-conda");
+        TestContext::mock_conda_prefix(&other_conda_env, "3.12.3")?;
+
+        let python = context
+            .run_with_vars(
+                &[
+                    (EnvVars::CONDA_PREFIX, Some(other_conda_env.as_os_str())),
+                    (EnvVars::CONDA_ROOT, Some(conda_root_env.as_os_str())),
+                    (
+                        EnvVars::CONDA_DEFAULT_ENV,
+                        Some(&OsString::from("other-conda")),
+                    ),
+                ],
+                || {
+                    find_python_installation(
+                        &PythonRequest::Default,
+                        EnvironmentPreference::OnlyVirtual,
+                        PythonPreference::OnlySystem,
+                        &context.cache,
+                        Preview::default(),
+                    )
+                },
+            )?
+            .unwrap();
+
+        assert_eq!(
+            python.interpreter().python_full_version().to_string(),
+            "3.12.3",
+            "Non-base conda environment should be available for virtual environment preference"
+        );
+
+        // When CONDA_PREFIX equals CONDA_DEFAULT_ENV, it should be treated as a virtual environment
+        let unnamed_env = context.tempdir.child("my-conda-env");
+        TestContext::mock_conda_prefix(&unnamed_env, "3.12.4")?;
+        let unnamed_env_path = unnamed_env.to_string_lossy().to_string();
+
         let python = context.run_with_vars(
             &[
-                ("CONDA_PREFIX", Some(condaenv.as_os_str())),
-                ("CONDA_DEFAULT_ENV", Some(&OsString::from("base"))),
+                (EnvVars::CONDA_PREFIX, Some(unnamed_env.as_os_str())),
+                (
+                    EnvVars::CONDA_DEFAULT_ENV,
+                    Some(&OsString::from(&unnamed_env_path)),
+                ),
             ],
             || {
                 find_python_installation(
@@ -1262,8 +1611,8 @@ mod tests {
 
         assert_eq!(
             python.interpreter().python_full_version().to_string(),
-            "3.12.0",
-            "We should find the conda environment"
+            "3.12.4",
+            "We should find the unnamed conda environment"
         );
 
         Ok(())

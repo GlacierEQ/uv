@@ -1,4 +1,4 @@
-#![cfg(feature = "r2")]
+#![cfg(feature = "test-r2")]
 
 use backon::{BackoffBuilder, Retryable};
 use futures::TryStreamExt;
@@ -23,7 +23,38 @@ async fn unzip(url: &str) -> anyhow::Result<(), uv_extract::Error> {
         .into_async_read();
 
     let target = tempfile::TempDir::new().map_err(uv_extract::Error::Io)?;
-    uv_extract::stream::unzip(reader.compat(), target.path()).await
+    uv_extract::stream::unzip(url, reader.compat(), target.path()).await?;
+    Ok(())
+}
+
+async fn unzip_seekable(url: &str) -> anyhow::Result<(), uv_extract::Error> {
+    let backoff = backon::ExponentialBuilder::default()
+        .with_min_delay(std::time::Duration::from_millis(500))
+        .with_max_times(5)
+        .build();
+
+    let download = || async {
+        let response = reqwest::get(url).await?;
+        Ok::<_, reqwest::Error>(response)
+    };
+
+    let response = download.retry(backoff).await.unwrap();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(std::io::Error::other)
+        .map_err(uv_extract::Error::Io)?;
+
+    let archive = tempfile::NamedTempFile::new().map_err(uv_extract::Error::Io)?;
+    fs_err::write(archive.path(), bytes).map_err(uv_extract::Error::Io)?;
+    let archive = fs_err::File::open(archive.path()).map_err(uv_extract::Error::Io)?;
+
+    let target = tempfile::TempDir::new().map_err(uv_extract::Error::Io)?;
+    let target_path = target.path().to_path_buf();
+    tokio::task::spawn_blocking(move || uv_extract::unzip(archive, &target_path))
+        .await
+        .expect("seekable ZIP extraction task should not panic")?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -47,6 +78,12 @@ async fn malo_accept_data_descriptor() {
 #[tokio::test]
 async fn malo_accept_deflate() {
     unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/accept/deflate.zip").await.unwrap();
+    insta::assert_debug_snapshot!((), @"()");
+}
+
+#[tokio::test]
+async fn malo_seekable_accept_deflate() {
+    unzip_seekable("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/accept/deflate.zip").await.unwrap();
     insta::assert_debug_snapshot!((), @"()");
 }
 
@@ -83,7 +120,7 @@ async fn malo_accept_zip64_eocd() {
 #[tokio::test]
 async fn malo_iffy_8bitcomment() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/8bitcomment.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         ZipInZip,
     )
@@ -93,7 +130,7 @@ async fn malo_iffy_8bitcomment() {
 #[tokio::test]
 async fn malo_iffy_extra3byte() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/extra3byte.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Ok(
         (),
     )
@@ -103,7 +140,7 @@ async fn malo_iffy_extra3byte() {
 #[tokio::test]
 async fn malo_iffy_non_ascii_original_name() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/non_ascii_original_name.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         LocalHeaderNotUtf8 {
             offset: 0,
@@ -115,7 +152,7 @@ async fn malo_iffy_non_ascii_original_name() {
 #[tokio::test]
 async fn malo_iffy_nosubdir() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/nosubdir.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Ok(
         (),
     )
@@ -125,7 +162,7 @@ async fn malo_iffy_nosubdir() {
 #[tokio::test]
 async fn malo_iffy_prefix() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/prefix.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         AsyncZip(
             UnexpectedHeaderError(
@@ -140,7 +177,7 @@ async fn malo_iffy_prefix() {
 #[tokio::test]
 async fn malo_iffy_suffix_not_comment() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/suffix_not_comment.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         TrailingContents,
     )
@@ -150,7 +187,7 @@ async fn malo_iffy_suffix_not_comment() {
 #[tokio::test]
 async fn malo_iffy_zip64_eocd_extensible_data() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/zip64_eocd_extensible_data.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         ExtensibleData,
     )
@@ -160,7 +197,7 @@ async fn malo_iffy_zip64_eocd_extensible_data() {
 #[tokio::test]
 async fn malo_iffy_zip64_extra_too_long() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/iffy/zip64_extra_too_long.zip").await;
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     Err(
         AsyncZip(
             Zip64ExtendedInformationFieldTooLong {
@@ -228,6 +265,18 @@ async fn malo_reject_data_descriptor_bad_crc() {
         path: "fixme",
         computed: 907060870,
         expected: 1,
+    }
+    "#);
+}
+
+#[tokio::test]
+async fn malo_seekable_malicious_short_usize() {
+    let result = unzip_seekable("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/malicious/short_usize.zip").await.unwrap_err();
+    insta::assert_debug_snapshot!(result, @r#"
+    BadUncompressedSize {
+        path: "file",
+        computed: 51,
+        expected: 9,
     }
     "#);
 }
@@ -301,7 +350,7 @@ async fn malo_reject_dupe_eocd() {
 #[tokio::test]
 async fn malo_reject_shortextra() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/reject/shortextra.zip").await.unwrap_err();
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     AsyncZip(
         InvalidExtraFieldHeader(
             9,
@@ -337,7 +386,7 @@ async fn malo_reject_zip64_extra_usize() {
 #[tokio::test]
 async fn malo_malicious_second_unicode_extra() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/malicious/second_unicode_extra.zip").await.unwrap_err();
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     AsyncZip(
         DuplicateExtraFieldHeader(
             28789,
@@ -349,7 +398,7 @@ async fn malo_malicious_second_unicode_extra() {
 #[tokio::test]
 async fn malo_malicious_short_usize_zip64() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/malicious/short_usize_zip64.zip").await.unwrap_err();
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     AsyncZip(
         Zip64ExtendedInformationFieldTooLong {
             expected: 16,
@@ -380,7 +429,7 @@ async fn malo_malicious_zip64_eocd_confusion() {
 #[tokio::test]
 async fn malo_malicious_unicode_extra_chain() {
     let result = unzip("https://pub-c6f28d316acd406eae43501e51ad30fa.r2.dev/0723f54ceb33a4fdc7f2eddc19635cd704d61c84/malicious/unicode_extra_chain.zip").await.unwrap_err();
-    insta::assert_debug_snapshot!(result, @r"
+    insta::assert_debug_snapshot!(result, @"
     AsyncZip(
         DuplicateExtraFieldHeader(
             28789,

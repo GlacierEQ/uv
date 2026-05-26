@@ -97,15 +97,28 @@ impl Default for DefaultExtras {
 /// See:
 /// - <https://peps.python.org/pep-0685/#specification/>
 /// - <https://packaging.python.org/en/latest/specifications/name-normalization/>
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[rkyv(derive(Debug))]
 pub struct ExtraName(SmallString);
 
 impl ExtraName {
     /// Create a validated, normalized extra name.
     ///
     /// At present, this is no more efficient than calling [`ExtraName::from_str`].
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn from_owned(name: String) -> Result<Self, InvalidNameError> {
         validate_and_normalize_ref(&name).map(Self)
     }

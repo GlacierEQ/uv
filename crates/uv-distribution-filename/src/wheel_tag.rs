@@ -37,6 +37,40 @@ pub(crate) enum WheelTag {
     Large { large: Box<WheelTagLarge> },
 }
 
+impl WheelTag {
+    /// Return the Python tags.
+    pub(crate) fn python_tags(&self) -> &[LanguageTag] {
+        match self {
+            Self::Small { small } => std::slice::from_ref(&small.python_tag),
+            Self::Large { large } => large.python_tag.as_slice(),
+        }
+    }
+
+    /// Return the ABI tags.
+    pub(crate) fn abi_tags(&self) -> &[AbiTag] {
+        match self {
+            Self::Small { small } => std::slice::from_ref(&small.abi_tag),
+            Self::Large { large } => large.abi_tag.as_slice(),
+        }
+    }
+
+    /// Return the platform tags.
+    pub(crate) fn platform_tags(&self) -> &[PlatformTag] {
+        match self {
+            Self::Small { small } => std::slice::from_ref(&small.platform_tag),
+            Self::Large { large } => large.platform_tag.as_slice(),
+        }
+    }
+
+    /// Return the build tag, if present.
+    pub(crate) fn build_tag(&self) -> Option<&BuildTag> {
+        match self {
+            Self::Small { .. } => None,
+            Self::Large { large } => large.build_tag.as_ref(),
+        }
+    }
+}
+
 impl Display for WheelTag {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -58,8 +92,8 @@ impl Display for WheelTag {
     rkyv::Deserialize,
     rkyv::Serialize,
 )]
-#[rkyv(derive(Debug))]
-#[allow(clippy::struct_field_names)]
+#[rkyv(derive(Debug), attr(expect(clippy::struct_field_names)))]
+#[expect(clippy::struct_field_names)]
 pub(crate) struct WheelTagSmall {
     /// The Python tag, e.g., `py3` in `1.2.3-py3-none-any`.
     pub(crate) python_tag: LanguageTag,
@@ -92,7 +126,6 @@ impl Display for WheelTagSmall {
     rkyv::Serialize,
 )]
 #[rkyv(derive(Debug))]
-#[allow(clippy::struct_field_names)]
 pub(crate) struct WheelTagLarge {
     /// The optional build tag, e.g., `73` in `1.2.3-73-py3-none-any`.
     pub(crate) build_tag: Option<BuildTag>,

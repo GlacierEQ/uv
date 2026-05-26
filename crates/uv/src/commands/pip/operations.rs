@@ -13,39 +13,43 @@ use tracing::debug;
 use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, RegistryClient};
 use uv_configuration::{
-    BuildOptions, Concurrency, Constraints, DependencyGroups, DryRun, ExtrasSpecification,
-    Overrides, Reinstall, Upgrade,
+    BuildOptions, Concurrency, Constraints, DependencyGroups, DryRun, Excludes,
+    ExtrasSpecification, Overrides, Reinstall, Upgrade,
 };
 use uv_dispatch::BuildDispatch;
 use uv_distribution::{DistributionDatabase, SourcedDependencyGroups};
 use uv_distribution_types::{
-    CachedDist, Diagnostic, InstalledDist, LocalDist, NameRequirementSpecification, Requirement,
-    ResolutionDiagnostic, UnresolvedRequirement, UnresolvedRequirementSpecification,
+    CachedDist, DependencyMetadata, Diagnostic, Dist, InstalledDist, InstalledVersion, LocalDist,
+    NameRequirementSpecification, Requirement, ResolutionDiagnostic, UnresolvedRequirement,
+    UnresolvedRequirementSpecification, VersionOrUrlRef,
 };
 use uv_distribution_types::{DistributionMetadata, InstalledMetadata, Name, Resolution};
 use uv_fs::Simplified;
 use uv_install_wheel::LinkMode;
-use uv_installer::{Plan, Planner, Preparer, SitePackages};
+use uv_installer::{InstallationStrategy, Plan, Planner, Preparer, SitePackages};
 use uv_normalize::PackageName;
-use uv_pep508::{MarkerEnvironment, RequirementOrigin};
+use uv_pep440::Version;
+use uv_pep508::{MarkerEnvironment, RequirementOrigin, VerbatimUrl};
 use uv_platform_tags::Tags;
+use uv_preview::Preview;
 use uv_pypi_types::{Conflicts, ResolverMarkerEnvironment};
+use uv_python::managed::{ManagedPythonInstallation, PythonMinorVersionLink};
 use uv_python::{PythonEnvironment, PythonInstallation};
 use uv_requirements::{
     GroupsSpecification, LookaheadResolver, NamedRequirementsResolver, RequirementsSource,
-    RequirementsSpecification, SourceTreeResolver,
+    RequirementsSpecification, SourceTree, SourceTreeResolution, SourceTreeResolver,
 };
 use uv_resolver::{
     DependencyMode, Exclusions, FlatIndex, InMemoryIndex, Manifest, Options, Preference,
-    Preferences, PythonRequirement, Resolver, ResolverEnvironment, ResolverOutput,
+    Preferences, PythonRequirement, Resolver, ResolverEnvironment, ResolverOutput, UpgradePackages,
 };
 use uv_tool::InstalledTools;
 use uv_types::{BuildContext, HashStrategy, InFlight, InstalledPackagesProvider};
 use uv_warnings::warn_user;
 
-use crate::commands::pip::loggers::{DefaultInstallLogger, InstallLogger, ResolveLogger};
+use crate::commands::compile_bytecode;
+use crate::commands::pip::loggers::{InstallLogger, ResolveLogger};
 use crate::commands::reporters::{InstallReporter, PrepareReporter, ResolverReporter};
-use crate::commands::{ChangeEventKind, DryRunEvent, compile_bytecode};
 use crate::printer::Printer;
 
 /// Consolidate the requirements for an installation.
@@ -53,6 +57,7 @@ pub(crate) async fn read_requirements(
     requirements: &[RequirementsSource],
     constraints: &[RequirementsSource],
     overrides: &[RequirementsSource],
+    excludes: &[RequirementsSource],
     extras: &ExtrasSpecification,
     groups: Option<&GroupsSpecification>,
     client_builder: &BaseClientBuilder<'_>,
@@ -60,18 +65,10 @@ pub(crate) async fn read_requirements(
     // If the user requests `extras` but does not provide a valid source (e.g., a `pyproject.toml`),
     // return an error.
     if !extras.is_empty() && !requirements.iter().any(RequirementsSource::allows_extras) {
-        let hint = if requirements
+        let has_editable = requirements
             .iter()
-            .any(|source| matches!(source, RequirementsSource::Editable(_)))
-        {
-            "Use `<dir>[extra]` syntax or `-r <file>` instead."
-        } else {
-            "Use `package[extra]` syntax instead."
-        };
-        return Err(anyhow!(
-            "Requesting extras requires a `pylock.toml`, `pyproject.toml`, `setup.cfg`, or `setup.py` file. {hint}"
-        )
-        .into());
+            .any(|source| matches!(source, RequirementsSource::Editable(_)));
+        return Err(anyhow::Error::new(ExtrasWithoutSourceError { has_editable }).into());
     }
 
     // Read all requirements from the provided sources.
@@ -79,6 +76,7 @@ pub(crate) async fn read_requirements(
         requirements,
         constraints,
         overrides,
+        excludes,
         groups,
         client_builder,
     )
@@ -91,7 +89,7 @@ pub(crate) async fn read_constraints(
     client_builder: &BaseClientBuilder<'_>,
 ) -> Result<Vec<NameRequirementSpecification>, Error> {
     Ok(
-        RequirementsSpecification::from_sources(&[], constraints, &[], None, client_builder)
+        RequirementsSpecification::from_sources(&[], constraints, &[], &[], None, client_builder)
             .await?
             .constraints,
     )
@@ -102,7 +100,8 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     requirements: Vec<UnresolvedRequirementSpecification>,
     constraints: Vec<NameRequirementSpecification>,
     overrides: Vec<UnresolvedRequirementSpecification>,
-    source_trees: Vec<PathBuf>,
+    excludes: Vec<PackageName>,
+    source_trees: Vec<SourceTree>,
     mut project: Option<PackageName>,
     workspace_members: BTreeSet<PackageName>,
     extras: &ExtrasSpecification,
@@ -121,11 +120,11 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     flat_index: &FlatIndex,
     index: &InMemoryIndex,
     build_dispatch: &BuildDispatch<'_>,
-    concurrency: Concurrency,
+    concurrency: &Concurrency,
     options: Options,
     logger: Box<dyn ResolveLogger>,
     printer: Printer,
-) -> Result<ResolverOutput, Error> {
+) -> Result<(ResolverOutput, HashStrategy), Error> {
     let start = std::time::Instant::now();
 
     // Resolve the requirements from the provided sources.
@@ -149,7 +148,11 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
                 NamedRequirementsResolver::new(
                     hasher,
                     index,
-                    DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+                    DistributionDatabase::new(
+                        client,
+                        build_dispatch,
+                        concurrency.downloads_semaphore.clone(),
+                    ),
                 )
                 .with_reporter(Arc::new(ResolverReporter::from(printer)))
                 .resolve(unnamed.into_iter())
@@ -163,16 +166,20 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
                 extras,
                 hasher,
                 index,
-                DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+                DistributionDatabase::new(
+                    client,
+                    build_dispatch,
+                    concurrency.downloads_semaphore.clone(),
+                ),
             )
             .with_reporter(Arc::new(ResolverReporter::from(printer)))
-            .resolve(source_trees.iter().map(PathBuf::as_path))
+            .resolve(source_trees.iter())
             .await?;
 
             // If we resolved a single project, use it for the project name.
             project = project.or_else(|| {
                 if let [resolution] = &resolutions[..] {
-                    Some(resolution.project.clone())
+                    Some(resolution.project().clone())
                 } else {
                     None
                 }
@@ -184,7 +191,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
                 .filter(|extra| {
                     !resolutions
                         .iter()
-                        .any(|resolution| resolution.extras.contains(extra))
+                        .any(|resolution| resolution.extras().contains(extra))
                 })
                 .collect::<Vec<_>>();
             if !unused_extras.is_empty() {
@@ -202,7 +209,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
             requirements.extend(
                 resolutions
                     .into_iter()
-                    .flat_map(|resolution| resolution.requirements),
+                    .flat_map(SourceTreeResolution::into_requirements),
             );
         }
 
@@ -211,15 +218,15 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
                 pyproject_path,
                 None,
                 build_dispatch.locations(),
-                build_dispatch.sources(),
+                build_dispatch.sources().clone(),
                 build_dispatch.workspace_cache(),
+                client.credentials_cache(),
             )
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read dependency groups from: {}\n{}",
-                    pyproject_path.display(),
-                    e
+            .with_context(|| {
+                format!(
+                    "Failed to read dependency groups from: {}",
+                    pyproject_path.display()
                 )
             })?;
 
@@ -250,6 +257,11 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         requirements
     };
 
+    // Incorporate hashes from requirements discovered while resolving source trees and groups.
+    let mut hasher = hasher
+        .clone()
+        .augment_with_requirements(requirements.iter())?;
+
     // Resolve the overrides from the provided sources.
     let overrides = {
         // Partition the overrides into named and unnamed requirements.
@@ -269,9 +281,13 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         if !unnamed.is_empty() {
             overrides.extend(
                 NamedRequirementsResolver::new(
-                    hasher,
+                    &hasher,
                     index,
-                    DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+                    DistributionDatabase::new(
+                        client,
+                        build_dispatch,
+                        concurrency.downloads_semaphore.clone(),
+                    ),
                 )
                 .with_reporter(Arc::new(ResolverReporter::from(printer)))
                 .resolve(unnamed.into_iter())
@@ -282,7 +298,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         overrides
     };
 
-    // Collect constraints and overrides.
+    // Collect constraints, overrides, and excludes.
     let constraints = Constraints::from_requirements(
         constraints
             .into_iter()
@@ -290,34 +306,42 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
             .chain(upgrade.constraints().cloned()),
     );
     let overrides = Overrides::from_requirements(overrides);
+    let excludes = excludes.into_iter().collect::<Excludes>();
     let preferences = Preferences::from_iter(preferences, &resolver_env);
 
     // Determine any lookahead requirements.
     let lookaheads = match options.dependency_mode {
         DependencyMode::Transitive => {
-            LookaheadResolver::new(
+            let (lookaheads, updated_hasher) = LookaheadResolver::new(
                 &requirements,
                 &constraints,
                 &overrides,
-                hasher,
+                &hasher,
                 index,
-                DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+                DistributionDatabase::new(
+                    client,
+                    build_dispatch,
+                    concurrency.downloads_semaphore.clone(),
+                ),
             )
             .with_reporter(Arc::new(ResolverReporter::from(printer)))
             .resolve(&resolver_env)
-            .await?
+            .await?;
+            hasher = updated_hasher;
+            lookaheads
         }
         DependencyMode::Direct => Vec::new(),
     };
 
     // TODO(zanieb): Consider consuming these instead of cloning
-    let exclusions = Exclusions::new(reinstall.clone(), upgrade.clone());
+    let exclusions = Exclusions::new(reinstall.clone(), UpgradePackages::for_non_project(upgrade));
 
     // Create a manifest of the requirements.
     let manifest = Manifest::new(
         requirements,
         constraints,
         overrides,
+        excludes,
         preferences,
         project,
         workspace_members,
@@ -345,10 +369,14 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
             tags,
             flat_index,
             index,
-            hasher,
+            &hasher,
             build_dispatch,
             installed_packages,
-            DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+            DistributionDatabase::new(
+                client,
+                build_dispatch,
+                concurrency.downloads_semaphore.clone(),
+            ),
         )?
         .with_reporter(Arc::new(reporter));
 
@@ -357,7 +385,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
 
     logger.on_complete(resolution.len(), start, printer)?;
 
-    Ok(resolution)
+    Ok((resolution, hasher))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -375,27 +403,110 @@ pub(crate) enum Modifications {
     Exact,
 }
 
+/// A distribution which was or would be modified
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ChangedDist {
+    Local(LocalDist),
+    Remote(Arc<Dist>),
+}
+
+impl Name for ChangedDist {
+    fn name(&self) -> &PackageName {
+        match self {
+            Self::Local(dist) => dist.name(),
+            Self::Remote(dist) => dist.name(),
+        }
+    }
+}
+
+/// The [`Version`] or [`VerbatimUrl`] for a changed dist.
+#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+pub(crate) enum ShortSpecifier<'a> {
+    Version(&'a Version),
+    Url(&'a VerbatimUrl),
+}
+
+impl std::fmt::Display for ShortSpecifier<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version(version) => version.fmt(f),
+            Self::Url(url) => write!(f, " @ {url}"),
+        }
+    }
+}
+
+/// The [`InstalledVersion`] or [`VerbatimUrl`] for a changed dist.
+#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+pub(crate) enum LongSpecifier<'a> {
+    InstalledVersion(InstalledVersion<'a>),
+    Url(&'a VerbatimUrl),
+}
+
+impl std::fmt::Display for LongSpecifier<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstalledVersion(version) => version.fmt(f),
+            Self::Url(url) => write!(f, " @ {url}"),
+        }
+    }
+}
+
+impl ChangedDist {
+    pub(crate) fn short_specifier(&self) -> ShortSpecifier<'_> {
+        match self {
+            Self::Local(dist) => ShortSpecifier::Version(dist.installed_version().version()),
+            Self::Remote(dist) => match dist.version_or_url() {
+                VersionOrUrlRef::Version(version) => ShortSpecifier::Version(version),
+                VersionOrUrlRef::Url(url) => ShortSpecifier::Url(url),
+            },
+        }
+    }
+
+    pub(crate) fn long_specifier(&self) -> LongSpecifier<'_> {
+        match self {
+            Self::Local(dist) => LongSpecifier::InstalledVersion(dist.installed_version()),
+            Self::Remote(dist) => match dist.version_or_url() {
+                VersionOrUrlRef::Version(version) => {
+                    LongSpecifier::InstalledVersion(InstalledVersion::Version(version))
+                }
+                VersionOrUrlRef::Url(url) => LongSpecifier::Url(url),
+            },
+        }
+    }
+
+    pub(crate) fn version(&self) -> Option<&Version> {
+        match self {
+            Self::Local(dist) => Some(dist.installed_version().version()),
+            Self::Remote(dist) => dist.version(),
+        }
+    }
+}
+
 /// A summary of the changes made to the environment during an installation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Changelog {
     /// The distributions that were installed.
-    pub(crate) installed: HashSet<LocalDist>,
+    pub(crate) installed: HashSet<ChangedDist>,
     /// The distributions that were uninstalled.
-    pub(crate) uninstalled: HashSet<LocalDist>,
+    pub(crate) uninstalled: HashSet<ChangedDist>,
     /// The distributions that were reinstalled.
-    pub(crate) reinstalled: HashSet<LocalDist>,
+    pub(crate) reinstalled: HashSet<ChangedDist>,
 }
 
 impl Changelog {
-    /// Create a [`Changelog`] from a list of installed and uninstalled distributions.
-    pub(crate) fn new(installed: Vec<CachedDist>, uninstalled: Vec<InstalledDist>) -> Self {
-        let mut uninstalled: HashSet<_> = uninstalled.into_iter().map(LocalDist::from).collect();
-
+    /// Create a [`Changelog`] from two iterators of [`ChangedDist`]s.
+    fn new<I, U>(installed: I, uninstalled: U) -> Self
+    where
+        I: IntoIterator<Item = ChangedDist>,
+        U: IntoIterator<Item = ChangedDist>,
+    {
+        // SAFETY: This is allowed because `LocalDist` implements `Hash` and `Eq` based solely on
+        // the inner `kind`, and omits the types that rely on internal mutability.
+        #[expect(clippy::mutable_key_type)]
+        let mut uninstalled: HashSet<_> = uninstalled.into_iter().collect();
         let (reinstalled, installed): (HashSet<_>, HashSet<_>) = installed
             .into_iter()
-            .map(LocalDist::from)
             .partition(|dist| uninstalled.contains(dist));
-
         uninstalled.retain(|dist| !reinstalled.contains(dist));
 
         Self {
@@ -405,13 +516,21 @@ impl Changelog {
         }
     }
 
+    /// Create a [`Changelog`] from a list of local distributions.
+    fn from_local(installed: Vec<CachedDist>, uninstalled: Vec<InstalledDist>) -> Self {
+        Self::new(
+            installed
+                .into_iter()
+                .map(|dist| ChangedDist::Local(dist.into())),
+            uninstalled
+                .into_iter()
+                .map(|dist| ChangedDist::Local(dist.into())),
+        )
+    }
+
     /// Create a [`Changelog`] from a list of installed distributions.
     pub(crate) fn from_installed(installed: Vec<CachedDist>) -> Self {
-        Self {
-            installed: installed.into_iter().map(LocalDist::from).collect(),
-            uninstalled: HashSet::default(),
-            reinstalled: HashSet::default(),
-        }
+        Self::from_local(installed, Vec::new())
     }
 
     /// Returns `true` if the changelog includes a distribution with the given name, either via
@@ -433,6 +552,7 @@ impl Changelog {
 pub(crate) async fn install(
     resolution: &Resolution,
     site_packages: SitePackages,
+    installation: InstallationStrategy,
     modifications: Modifications,
     reinstall: &Reinstall,
     build_options: &BuildOptions,
@@ -442,7 +562,7 @@ pub(crate) async fn install(
     tags: &Tags,
     client: &RegistryClient,
     in_flight: &InFlight,
-    concurrency: Concurrency,
+    concurrency: &Concurrency,
     build_dispatch: &BuildDispatch<'_>,
     cache: &Cache,
     venv: &PythonEnvironment,
@@ -450,7 +570,7 @@ pub(crate) async fn install(
     installer_metadata: bool,
     dry_run: DryRun,
     printer: Printer,
-    preview: uv_configuration::Preview,
+    preview: Preview,
 ) -> Result<Changelog, Error> {
     let start = std::time::Instant::now();
 
@@ -459,6 +579,7 @@ pub(crate) async fn install(
     let plan = Planner::new(resolution)
         .build(
             site_packages,
+            installation,
             reinstall,
             build_options,
             hasher,
@@ -474,8 +595,15 @@ pub(crate) async fn install(
         .context("Failed to determine installation plan")?;
 
     if dry_run.enabled() {
-        report_dry_run(dry_run, resolution, plan, modifications, start, printer)?;
-        return Ok(Changelog::default());
+        return report_dry_run(
+            dry_run,
+            resolution,
+            plan,
+            modifications,
+            start,
+            logger.as_ref(),
+            printer,
+        );
     }
 
     let Plan {
@@ -498,7 +626,7 @@ pub(crate) async fn install(
         && extraneous.is_empty()
         && !compile
     {
-        logger.on_audit(resolution.len(), start, printer)?;
+        logger.on_check(resolution.len(), start, printer, dry_run)?;
         return Ok(Changelog::default());
     }
 
@@ -575,14 +703,14 @@ pub(crate) async fn install(
     }
 
     if compile {
-        compile_bytecode(venv, &concurrency, cache, printer).await?;
+        compile_bytecode(venv, concurrency, cache, printer).await?;
     }
 
     // Construct a summary of the changes made to the environment.
-    let changelog = Changelog::new(installs, uninstalls);
+    let changelog = Changelog::from_local(installs, uninstalls);
 
     // Notify the user of any environment modifications.
-    logger.on_complete(&changelog, printer)?;
+    logger.on_complete(&changelog, printer, dry_run)?;
 
     Ok(changelog)
 }
@@ -612,14 +740,14 @@ async fn execute_plan(
     tags: &Tags,
     client: &RegistryClient,
     in_flight: &InFlight,
-    concurrency: Concurrency,
+    concurrency: &Concurrency,
     build_dispatch: &BuildDispatch<'_>,
     cache: &Cache,
     venv: &PythonEnvironment,
     logger: &dyn InstallLogger,
     installer_metadata: bool,
     printer: Printer,
-    preview: uv_configuration::Preview,
+    preview: Preview,
 ) -> Result<(Vec<CachedDist>, Vec<InstalledDist>), Error> {
     let Plan {
         cached,
@@ -639,7 +767,11 @@ async fn execute_plan(
             tags,
             hasher,
             build_options,
-            DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
+            DistributionDatabase::new(
+                client,
+                build_dispatch,
+                concurrency.downloads_semaphore.clone(),
+            ),
         )
         .with_reporter(Arc::new(
             PrepareReporter::from(printer).with_length(remote.len() as u64),
@@ -649,7 +781,13 @@ async fn execute_plan(
             .prepare(remote.clone(), in_flight, resolution)
             .await?;
 
-        logger.on_prepare(wheels.len(), phase.map(InstallPhase::label), start, printer)?;
+        logger.on_prepare(
+            wheels.len(),
+            phase.map(InstallPhase::label),
+            start,
+            printer,
+            DryRun::Disabled,
+        )?;
 
         wheels
     };
@@ -659,8 +797,9 @@ async fn execute_plan(
     if !uninstalls.is_empty() {
         let start = std::time::Instant::now();
 
+        let layout = venv.interpreter().layout();
         for dist_info in &uninstalls {
-            match uv_installer::uninstall(dist_info).await {
+            match uv_installer::uninstall(dist_info, &layout).await {
                 Ok(summary) => {
                     debug!(
                         "Uninstalled {} ({} file{}, {} director{})",
@@ -683,7 +822,7 @@ async fn execute_plan(
                     uv_install_wheel::Error::MissingTopLevel(_),
                 )) => {
                     warn_user!(
-                        "Failed to uninstall package at {} due to missing `top-level.txt` file. Installation may result in an incomplete environment.",
+                        "Failed to uninstall package at {} due to missing `top_level.txt` file. Installation may result in an incomplete environment.",
                         dist_info.install_path().user_display().cyan(),
                     );
                 }
@@ -691,7 +830,7 @@ async fn execute_plan(
             }
         }
 
-        logger.on_uninstall(uninstalls.len(), start, printer)?;
+        logger.on_uninstall(uninstalls.len(), start, printer, DryRun::Disabled)?;
     }
 
     // Install the resolved distributions.
@@ -710,14 +849,13 @@ async fn execute_plan(
             // task.
             .install_blocking(installs)?;
 
-        logger.on_install(installs.len(), start, printer)?;
+        logger.on_install(installs.len(), start, printer, DryRun::Disabled)?;
     }
 
     Ok((installs, uninstalls))
 }
 
 /// Display a message about the interpreter that was selected for the operation.
-#[allow(clippy::result_large_err)]
 pub(crate) fn report_interpreter(
     python: &PythonInstallation,
     dimmed: bool,
@@ -733,9 +871,10 @@ pub(crate) fn report_interpreter(
                 printer.stderr(),
                 "{}",
                 format!(
-                    "Using {} {}",
+                    "Using {} {}{}",
                     implementation.pretty(),
-                    interpreter.python_version()
+                    interpreter.python_version(),
+                    interpreter.variant().display_suffix(),
                 )
                 .dimmed()
             )?;
@@ -744,9 +883,10 @@ pub(crate) fn report_interpreter(
                 printer.stderr(),
                 "{}",
                 format!(
-                    "Using {} {} interpreter at: {}",
+                    "Using {} {}{} interpreter at: {}",
                     implementation.pretty(),
                     interpreter.python_version(),
+                    interpreter.variant().display_suffix(),
                     interpreter.sys_executable().user_display()
                 )
                 .dimmed()
@@ -756,16 +896,18 @@ pub(crate) fn report_interpreter(
         if managed {
             writeln!(
                 printer.stderr(),
-                "Using {} {}",
+                "Using {} {}{}",
                 implementation.pretty(),
-                interpreter.python_version().cyan()
+                interpreter.python_version().cyan(),
+                interpreter.variant().display_suffix().cyan()
             )?;
         } else {
             writeln!(
                 printer.stderr(),
-                "Using {} {} interpreter at: {}",
+                "Using {} {}{} interpreter at: {}",
                 implementation.pretty(),
                 interpreter.python_version(),
+                interpreter.variant().display_suffix(),
                 interpreter.sys_executable().user_display().cyan()
             )?;
         }
@@ -775,19 +917,31 @@ pub(crate) fn report_interpreter(
 }
 
 /// Display a message about the target environment for the operation.
-#[allow(clippy::result_large_err)]
 pub(crate) fn report_target_environment(
     env: &PythonEnvironment,
     cache: &Cache,
     printer: Printer,
 ) -> Result<(), Error> {
+    // Resolve minor-version link directories (e.g., `cpython-3.12` → `cpython-3.12.12`).
+    // On Windows, junction points aren't resolved by the interpreter's `sys.prefix`, so we
+    // use the target directory from the minor-version link to display the actual installation.
+    // This only applies to managed installations, not virtual environments.
+    let root = if env.interpreter().is_virtualenv() {
+        env.root().to_path_buf()
+    } else {
+        ManagedPythonInstallation::try_from_interpreter(env.interpreter())
+            .and_then(|installation| PythonMinorVersionLink::from_installation(&installation))
+            .map(|link| link.target_directory)
+            .unwrap_or_else(|| env.root().to_path_buf())
+    };
+
     let message = format!(
         "Using Python {} environment at: {}",
         env.interpreter().python_version(),
-        env.root().user_display()
+        root.user_display()
     );
 
-    let Ok(target) = std::path::absolute(env.root()) else {
+    let Ok(target) = std::path::absolute(&root) else {
         debug!("{}", message);
         return Ok(());
     };
@@ -818,15 +972,15 @@ pub(crate) fn report_target_environment(
 }
 
 /// Report on the results of a dry-run installation.
-#[allow(clippy::result_large_err)]
 fn report_dry_run(
     dry_run: DryRun,
     resolution: &Resolution,
     plan: Plan,
     modifications: Modifications,
     start: std::time::Instant,
+    logger: &dyn InstallLogger,
     printer: Printer,
-) -> Result<(), Error> {
+) -> Result<Changelog, Error> {
     let Plan {
         cached,
         remote,
@@ -842,25 +996,15 @@ fn report_dry_run(
 
     // Nothing to do.
     if remote.is_empty() && cached.is_empty() && reinstalls.is_empty() && extraneous.is_empty() {
-        DefaultInstallLogger.on_audit(resolution.len(), start, printer)?;
-        writeln!(printer.stderr(), "Would make no changes")?;
-        return Ok(());
+        logger.on_check(resolution.len(), start, printer, dry_run)?;
+        return Ok(Changelog::default());
     }
 
     // Download, build, and unzip any missing distributions.
     let wheels = if remote.is_empty() {
         vec![]
     } else {
-        let s = if remote.len() == 1 { "" } else { "s" };
-        writeln!(
-            printer.stderr(),
-            "{}",
-            format!(
-                "Would download {}",
-                format!("{} package{}", remote.len(), s).bold(),
-            )
-            .dimmed()
-        )?;
+        logger.on_prepare(remote.len(), None, start, printer, dry_run)?;
         remote.clone()
     };
 
@@ -868,91 +1012,38 @@ fn report_dry_run(
     let uninstalls = extraneous.len() + reinstalls.len();
 
     if uninstalls > 0 {
-        let s = if uninstalls == 1 { "" } else { "s" };
-        writeln!(
-            printer.stderr(),
-            "{}",
-            format!(
-                "Would uninstall {}",
-                format!("{uninstalls} package{s}").bold(),
-            )
-            .dimmed()
-        )?;
+        logger.on_uninstall(uninstalls, start, printer, dry_run)?;
     }
 
     // Install the resolved distributions.
     let installs = wheels.len() + cached.len();
 
     if installs > 0 {
-        let s = if installs == 1 { "" } else { "s" };
-        writeln!(
-            printer.stderr(),
-            "{}",
-            format!("Would install {}", format!("{installs} package{s}").bold()).dimmed()
-        )?;
+        logger.on_install(installs, start, printer, dry_run)?;
     }
 
-    // TODO(charlie): DRY this up with `report_modifications`. The types don't quite line up.
-    for event in reinstalls
+    let uninstalled = reinstalls
         .into_iter()
-        .chain(extraneous.into_iter())
-        .map(|distribution| DryRunEvent {
-            name: distribution.name().clone(),
-            version: distribution.installed_version().to_string(),
-            kind: ChangeEventKind::Removed,
-        })
-        .chain(wheels.into_iter().map(|distribution| DryRunEvent {
-            name: distribution.name().clone(),
-            version: distribution.version_or_url().to_string(),
-            kind: ChangeEventKind::Added,
-        }))
-        .chain(cached.into_iter().map(|distribution| DryRunEvent {
-            name: distribution.name().clone(),
-            version: distribution.installed_version().to_string(),
-            kind: ChangeEventKind::Added,
-        }))
-        .sorted_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)))
-    {
-        match event.kind {
-            ChangeEventKind::Added => {
-                writeln!(
-                    printer.stderr(),
-                    " {} {}{}",
-                    "+".green(),
-                    event.name.bold(),
-                    event.version.dimmed()
-                )?;
-            }
-            ChangeEventKind::Removed => {
-                writeln!(
-                    printer.stderr(),
-                    " {} {}{}",
-                    "-".red(),
-                    event.name.bold(),
-                    event.version.dimmed()
-                )?;
-            }
-            ChangeEventKind::Reinstalled => {
-                writeln!(
-                    printer.stderr(),
-                    " {} {}{}",
-                    "~".yellow(),
-                    event.name.bold(),
-                    event.version.dimmed()
-                )?;
-            }
-        }
-    }
+        .chain(extraneous)
+        .map(|dist| ChangedDist::Local(dist.into()));
+    let installed = wheels.into_iter().map(ChangedDist::Remote).chain(
+        cached
+            .into_iter()
+            .map(|dist| ChangedDist::Local(dist.into())),
+    );
+
+    let changelog = Changelog::new(installed, uninstalled);
+
+    logger.on_complete(&changelog, printer, dry_run)?;
 
     if matches!(dry_run, DryRun::Check) {
-        return Err(Error::OutdatedEnvironment);
+        return Err(Error::OutdatedEnvironment(Box::new(changelog)));
     }
 
-    Ok(())
+    Ok(changelog)
 }
 
 /// Report any diagnostics on resolved distributions.
-#[allow(clippy::result_large_err)]
 pub(crate) fn diagnose_resolution(
     diagnostics: &[ResolutionDiagnostic],
     printer: Printer,
@@ -970,15 +1061,16 @@ pub(crate) fn diagnose_resolution(
 }
 
 /// Report any diagnostics on installed distributions in the Python environment.
-#[allow(clippy::result_large_err)]
 pub(crate) fn diagnose_environment(
     resolution: &Resolution,
     venv: &PythonEnvironment,
     markers: &ResolverMarkerEnvironment,
+    tags: &Tags,
+    dependency_metadata: &DependencyMetadata,
     printer: Printer,
 ) -> Result<(), Error> {
     let site_packages = SitePackages::from_environment(venv)?;
-    for diagnostic in site_packages.diagnostics(markers)? {
+    for diagnostic in site_packages.diagnostics(markers, tags, dependency_metadata)? {
         // Only surface diagnostics that are "relevant" to the current resolution.
         if resolution
             .distributions()
@@ -1023,5 +1115,41 @@ pub(crate) enum Error {
     Anyhow(#[from] anyhow::Error),
 
     #[error("The environment is outdated; run `{}` to update the environment", "uv sync".cyan())]
-    OutdatedEnvironment,
+    OutdatedEnvironment(Box<Changelog>),
+}
+
+impl uv_errors::Hint for Error {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        match self {
+            Self::Resolve(resolve_err) => resolve_err.hints(),
+            Self::Anyhow(err) => {
+                for cause in err.chain() {
+                    if let Some(extra_err) = cause.downcast_ref::<ExtrasWithoutSourceError>() {
+                        return uv_errors::Hint::hints(extra_err);
+                    }
+                }
+                uv_errors::Hints::none()
+            }
+            _ => uv_errors::Hints::none(),
+        }
+    }
+}
+
+/// Extras were requested but no valid source was provided.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Requesting extras requires a `pylock.toml`, `pyproject.toml`, `setup.cfg`, or `setup.py` file"
+)]
+pub(crate) struct ExtrasWithoutSourceError {
+    pub(crate) has_editable: bool,
+}
+
+impl uv_errors::Hint for ExtrasWithoutSourceError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        uv_errors::Hints::from(if self.has_editable {
+            "Use `<dir>[extra]` syntax or `-r <file>` instead"
+        } else {
+            "Use `package[extra]` syntax instead"
+        })
+    }
 }

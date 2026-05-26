@@ -1,29 +1,130 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use http::HeaderValue;
+use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
+use url::Url;
 
 use uv_auth::{AuthPolicy, Credentials};
 use uv_redacted::DisplaySafeUrl;
 use uv_small_str::SmallString;
 
+use crate::exclude_newer::ExcludeNewerOverride;
 use crate::index_name::{IndexName, IndexNameError};
 use crate::origin::Origin;
 use crate::{IndexStatusCodeStrategy, IndexUrl, IndexUrlError, SerializableStatusCode};
 
 /// Cache control configuration for an index.
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "kebab-case")]
 pub struct IndexCacheControl {
     /// Cache control header for Simple API requests.
-    pub api: Option<SmallString>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub api: Option<HeaderValue>,
     /// Cache control header for file downloads.
-    pub files: Option<SmallString>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub files: Option<HeaderValue>,
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+impl IndexCacheControl {
+    /// Return the default Simple API cache control headers for the given index URL, if applicable.
+    fn simple_api_cache_control(_url: &Url) -> Option<HeaderValue> {
+        None
+    }
+
+    /// Return the default files cache control headers for the given index URL, if applicable.
+    fn artifact_cache_control(url: &Url) -> Option<HeaderValue> {
+        let dominated_by_pytorch_or_nvidia = url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("download.pytorch.org")
+                || host.eq_ignore_ascii_case("pypi.nvidia.com")
+        });
+        if dominated_by_pytorch_or_nvidia {
+            // Some wheels in the PyTorch registry were accidentally uploaded with `no-cache,no-store,must-revalidate`.
+            // The PyTorch team plans to correct this in the future, but in the meantime we override
+            // the cache control headers to allow caching of static files.
+            //
+            // See: https://github.com/pytorch/pytorch/pull/149218
+            //
+            // The same issue applies to files hosted on `pypi.nvidia.com`.
+            Some(HeaderValue::from_static(
+                "max-age=365000000, immutable, public",
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct IndexCacheControlRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<&'a str>,
+}
+
+impl Serialize for IndexCacheControl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        IndexCacheControlRef {
+            api: self.api.as_ref().map(|api| {
+                api.to_str()
+                    .expect("cache-control.api is always parsed from a string")
+            }),
+            files: self.files.as_ref().map(|files| {
+                files
+                    .to_str()
+                    .expect("cache-control.files is always parsed from a string")
+            }),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct IndexCacheControlWire {
+    api: Option<SmallString>,
+    files: Option<SmallString>,
+}
+
+impl<'de> Deserialize<'de> for IndexCacheControl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = IndexCacheControlWire::deserialize(deserializer)?;
+
+        let api = wire
+            .api
+            .map(|api| {
+                HeaderValue::from_str(api.as_ref()).map_err(|_| {
+                    serde::de::Error::custom(
+                        "`cache-control.api` must be a valid HTTP header value",
+                    )
+                })
+            })
+            .transpose()?;
+        let files = wire
+            .files
+            .map(|files| {
+                HeaderValue::from_str(files.as_ref()).map_err(|_| {
+                    serde::de::Error::custom(
+                        "`cache-control.files` must be a valid HTTP header value",
+                    )
+                })
+            })
+            .transpose()?;
+
+        Ok(Self { api, files })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub struct Index {
@@ -35,7 +136,7 @@ pub struct Index {
     /// ```toml
     /// [[tool.uv.index]]
     /// name = "pytorch"
-    /// url = "https://download.pytorch.org/whl/cu121"
+    /// url = "https://download.pytorch.org/whl/cu130"
     ///
     /// [tool.uv.sources]
     /// torch = { index = "pytorch" }
@@ -53,7 +154,7 @@ pub struct Index {
     /// ```toml
     /// [[tool.uv.index]]
     /// name = "pytorch"
-    /// url = "https://download.pytorch.org/whl/cu121"
+    /// url = "https://download.pytorch.org/whl/cu130"
     /// explicit = true
     ///
     /// [tool.uv.sources]
@@ -129,6 +230,121 @@ pub struct Index {
     /// ```
     #[serde(default)]
     pub cache_control: Option<IndexCacheControl>,
+    /// An index-specific `exclude-newer` cutoff.
+    ///
+    /// Accepts the same date, timestamp, and duration values as the global `exclude-newer`
+    /// setting. Set this to `false` to disable `exclude-newer` for this index entirely.
+    ///
+    /// When set to a value, packages resolved from this index will use that cutoff instead of the
+    /// globally-specified value, unless a package-specific `exclude-newer-package` override is
+    /// present.
+    ///
+    /// This option is in preview and may change in any future release.
+    ///
+    /// ```toml
+    /// [tool.uv]
+    /// exclude-newer = "2025-01-01T00:00:00Z"
+    ///
+    /// [[tool.uv.index]]
+    /// name = "internal"
+    /// url = "https://internal.example.com/simple"
+    /// exclude-newer = "7 days"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "ExcludeNewerOverride"))]
+    pub exclude_newer: Option<ExcludeNewerOverride>,
+}
+
+impl PartialEq for Index {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            name,
+            url,
+            explicit,
+            default,
+            origin: _,
+            format,
+            publish_url,
+            authenticate,
+            ignore_error_codes,
+            cache_control,
+            exclude_newer,
+        } = self;
+        *url == other.url
+            && *name == other.name
+            && *explicit == other.explicit
+            && *default == other.default
+            && *format == other.format
+            && *publish_url == other.publish_url
+            && *authenticate == other.authenticate
+            && *ignore_error_codes == other.ignore_error_codes
+            && *cache_control == other.cache_control
+            && *exclude_newer == other.exclude_newer
+    }
+}
+
+impl Eq for Index {}
+
+impl PartialOrd for Index {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Index {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let Self {
+            name,
+            url,
+            explicit,
+            default,
+            origin: _,
+            format,
+            publish_url,
+            authenticate,
+            ignore_error_codes,
+            cache_control,
+            exclude_newer,
+        } = self;
+        url.cmp(&other.url)
+            .then_with(|| name.cmp(&other.name))
+            .then_with(|| explicit.cmp(&other.explicit))
+            .then_with(|| default.cmp(&other.default))
+            .then_with(|| format.cmp(&other.format))
+            .then_with(|| publish_url.cmp(&other.publish_url))
+            .then_with(|| authenticate.cmp(&other.authenticate))
+            .then_with(|| ignore_error_codes.cmp(&other.ignore_error_codes))
+            .then_with(|| cache_control.cmp(&other.cache_control))
+            .then_with(|| exclude_newer.cmp(&other.exclude_newer))
+    }
+}
+
+impl std::hash::Hash for Index {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            name,
+            url,
+            explicit,
+            default,
+            origin: _,
+            format,
+            publish_url,
+            authenticate,
+            ignore_error_codes,
+            cache_control,
+            exclude_newer,
+        } = self;
+        url.hash(state);
+        name.hash(state);
+        explicit.hash(state);
+        default.hash(state);
+        format.hash(state);
+        publish_url.hash(state);
+        authenticate.hash(state);
+        ignore_error_codes.hash(state);
+        cache_control.hash(state);
+        exclude_newer.hash(state);
+    }
 }
 
 #[derive(
@@ -168,6 +384,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            exclude_newer: None,
         }
     }
 
@@ -184,6 +401,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            exclude_newer: None,
         }
     }
 
@@ -200,6 +418,7 @@ impl Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            exclude_newer: None,
         }
     }
 
@@ -233,6 +452,18 @@ impl Index {
         self.url.root()
     }
 
+    /// If credentials are available (via the URL or environment) and [`AuthPolicy`] is
+    /// [`AuthPolicy::Auto`], promote to [`AuthPolicy::Always`] so that future operations
+    /// (e.g., `uv tool upgrade`) know that authentication is required even after the credentials
+    /// are stripped from the stored URL.
+    #[must_use]
+    pub fn with_promoted_auth_policy(mut self) -> Self {
+        if matches!(self.authenticate, AuthPolicy::Auto) && self.credentials().is_some() {
+            self.authenticate = AuthPolicy::Always;
+        }
+        self
+    }
+
     /// Retrieve the credentials for the index, either from the environment, or from the URL itself.
     pub fn credentials(&self) -> Option<Credentials> {
         // If the index is named, and credentials are provided via the environment, prefer those.
@@ -264,6 +495,27 @@ impl Index {
             IndexStatusCodeStrategy::from_index_url(self.url.url())
         }
     }
+
+    /// Return the cache control header for file requests to this index, if any.
+    pub(crate) fn artifact_cache_control(&self) -> Option<HeaderValue> {
+        self.cache_control
+            .as_ref()
+            .and_then(|cache_control| cache_control.files.clone())
+            .or_else(|| IndexCacheControl::artifact_cache_control(self.url.url()))
+    }
+
+    /// Return the cache control header for API requests to this index, if any.
+    pub(crate) fn simple_api_cache_control(&self) -> Option<HeaderValue> {
+        self.cache_control
+            .as_ref()
+            .and_then(|cache_control| cache_control.api.clone())
+            .or_else(|| IndexCacheControl::simple_api_cache_control(self.url.url()))
+    }
+
+    /// Return the `exclude-newer` setting for this index.
+    pub fn exclude_newer(&self) -> Option<&ExcludeNewerOverride> {
+        self.exclude_newer.as_ref()
+    }
 }
 
 impl From<IndexUrl> for Index {
@@ -279,6 +531,7 @@ impl From<IndexUrl> for Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            exclude_newer: None,
         }
     }
 }
@@ -303,6 +556,7 @@ impl FromStr for Index {
                     authenticate: AuthPolicy::default(),
                     ignore_error_codes: None,
                     cache_control: None,
+                    exclude_newer: None,
                 });
             }
         }
@@ -320,6 +574,7 @@ impl FromStr for Index {
             authenticate: AuthPolicy::default(),
             ignore_error_codes: None,
             cache_control: None,
+            exclude_newer: None,
         })
     }
 }
@@ -405,6 +660,59 @@ impl<'a> From<&'a IndexUrl> for IndexMetadataRef<'a> {
     }
 }
 
+/// Wire type for deserializing an [`Index`] with validation.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct IndexWire {
+    name: Option<IndexName>,
+    url: IndexUrl,
+    #[serde(default)]
+    explicit: bool,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    format: IndexFormat,
+    publish_url: Option<DisplaySafeUrl>,
+    #[serde(default)]
+    authenticate: AuthPolicy,
+    #[serde(default)]
+    ignore_error_codes: Option<Vec<SerializableStatusCode>>,
+    #[serde(default)]
+    cache_control: Option<IndexCacheControl>,
+    #[serde(default)]
+    exclude_newer: Option<ExcludeNewerOverride>,
+}
+
+impl<'de> Deserialize<'de> for Index {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = IndexWire::deserialize(deserializer)?;
+
+        if wire.explicit && wire.name.is_none() {
+            return Err(serde::de::Error::custom(format!(
+                "An index with `explicit = true` requires a `name`: {}",
+                wire.url
+            )));
+        }
+
+        Ok(Self {
+            name: wire.name,
+            url: wire.url,
+            explicit: wire.explicit,
+            default: wire.default,
+            origin: None,
+            format: wire.format,
+            publish_url: wire.publish_url,
+            authenticate: wire.authenticate,
+            ignore_error_codes: wire.ignore_error_codes,
+            cache_control: wire.cache_control,
+            exclude_newer: wire.exclude_newer,
+        })
+    }
+}
+
 /// An error that can occur when parsing an [`Index`].
 #[derive(Error, Debug)]
 pub enum IndexSourceError {
@@ -419,6 +727,7 @@ pub enum IndexSourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
 
     #[test]
     fn test_index_cache_control_headers() {
@@ -432,9 +741,16 @@ mod tests {
         let index: Index = toml::from_str(toml_str).unwrap();
         assert_eq!(index.name.as_ref().unwrap().as_ref(), "test-index");
         assert!(index.cache_control.is_some());
+        assert_eq!(index.exclude_newer, None);
         let cache_control = index.cache_control.as_ref().unwrap();
-        assert_eq!(cache_control.api.as_deref(), Some("max-age=600"));
-        assert_eq!(cache_control.files.as_deref(), Some("max-age=3600"));
+        assert_eq!(
+            cache_control.api,
+            Some(HeaderValue::from_static("max-age=600"))
+        );
+        assert_eq!(
+            cache_control.files,
+            Some(HeaderValue::from_static("max-age=3600"))
+        );
     }
 
     #[test]
@@ -448,6 +764,7 @@ mod tests {
         let index: Index = toml::from_str(toml_str).unwrap();
         assert_eq!(index.name.as_ref().unwrap().as_ref(), "test-index");
         assert_eq!(index.cache_control, None);
+        assert_eq!(index.exclude_newer, None);
     }
 
     #[test]
@@ -462,8 +779,71 @@ mod tests {
         let index: Index = toml::from_str(toml_str).unwrap();
         assert_eq!(index.name.as_ref().unwrap().as_ref(), "test-index");
         assert!(index.cache_control.is_some());
+        assert_eq!(index.exclude_newer, None);
         let cache_control = index.cache_control.as_ref().unwrap();
-        assert_eq!(cache_control.api.as_deref(), Some("max-age=300"));
+        assert_eq!(
+            cache_control.api,
+            Some(HeaderValue::from_static("max-age=300"))
+        );
         assert_eq!(cache_control.files, None);
+    }
+
+    #[test]
+    fn test_index_invalid_api_cache_control() {
+        let toml_str = r#"
+            name = "test-index"
+            url = "https://test.example.com/simple"
+            cache-control = { api = "max-age=600\n" }
+        "#;
+
+        let err = toml::from_str::<Index>(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`cache-control.api` must be a valid HTTP header value")
+        );
+    }
+
+    #[test]
+    fn test_index_invalid_files_cache_control() {
+        let toml_str = r#"
+            name = "test-index"
+            url = "https://test.example.com/simple"
+            cache-control = { files = "max-age=3600\n" }
+        "#;
+
+        let err = toml::from_str::<Index>(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`cache-control.files` must be a valid HTTP header value")
+        );
+    }
+
+    #[test]
+    fn test_index_exclude_newer_disable() {
+        let toml_str = r#"
+            name = "internal"
+            url = "https://internal.example.com/simple"
+            exclude-newer = false
+        "#;
+
+        let index: Index = toml::from_str(toml_str).unwrap();
+        assert_eq!(index.name.as_ref().unwrap().as_ref(), "internal");
+        assert_eq!(index.exclude_newer, Some(ExcludeNewerOverride::Disabled));
+    }
+
+    #[test]
+    fn test_index_exclude_newer_relative() {
+        let toml_str = r#"
+            name = "internal"
+            url = "https://internal.example.com/simple"
+            exclude-newer = "7 days"
+        "#;
+
+        let index: Index = toml::from_str(toml_str).unwrap();
+        assert_eq!(index.name.as_ref().unwrap().as_ref(), "internal");
+        assert!(matches!(
+            index.exclude_newer,
+            Some(ExcludeNewerOverride::Enabled(_))
+        ));
     }
 }

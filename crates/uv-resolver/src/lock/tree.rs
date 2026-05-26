@@ -10,12 +10,13 @@ use petgraph::{Direction, Graph};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use uv_configuration::DependencyGroupsWithDefaults;
+use uv_console::human_readable_bytes;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::Version;
 use uv_pep508::MarkerTree;
 use uv_pypi_types::ResolverMarkerEnvironment;
 
-use crate::lock::PackageId;
+use crate::lock::{Package, PackageId};
 use crate::{Lock, PackageMap};
 
 #[derive(Debug)]
@@ -30,6 +31,12 @@ pub struct TreeDisplay<'env> {
     depth: usize,
     /// Whether to de-duplicate the displayed dependencies.
     no_dedupe: bool,
+    /// Whether the graph edges have been reversed (i.e., `--invert` mode).
+    invert: bool,
+    /// Reference to the lock to look up additional metadata (e.g., wheel sizes).
+    lock: &'env Lock,
+    /// Whether to show sizes in the rendered output.
+    show_sizes: bool,
 }
 
 impl<'env> TreeDisplay<'env> {
@@ -41,9 +48,10 @@ impl<'env> TreeDisplay<'env> {
         depth: usize,
         prune: &[PackageName],
         packages: &[PackageName],
-        dev: &DependencyGroupsWithDefaults,
+        groups: &DependencyGroupsWithDefaults,
         no_dedupe: bool,
         invert: bool,
+        show_sizes: bool,
     ) -> Self {
         // Identify any workspace members.
         //
@@ -95,7 +103,7 @@ impl<'env> TreeDisplay<'env> {
             // Add an edge from the root.
             graph.add_edge(root, index, Edge::Prod(None));
 
-            if dev.prod() {
+            if groups.prod() {
                 // Push its dependencies on the queue.
                 if seen.insert((id, None)) {
                     queue.push_back((id, None));
@@ -114,7 +122,7 @@ impl<'env> TreeDisplay<'env> {
                 .dependency_groups
                 .iter()
                 .filter_map(|(group, deps)| {
-                    if dev.contains(group) {
+                    if groups.contains(group) {
                         Some(deps.iter().map(move |dep| (group, dep)))
                     } else {
                         None
@@ -356,40 +364,46 @@ impl<'env> TreeDisplay<'env> {
 
         // Compute the list of roots.
         let roots = {
-            let mut edges = vec![];
+            // If specific packages were requested, use them as roots.
+            if !packages.is_empty() {
+                let mut roots = graph
+                    .node_indices()
+                    .filter(|index| {
+                        let Node::Package(package_id) = graph[*index] else {
+                            return false;
+                        };
+                        packages.contains(&package_id.name)
+                    })
+                    .collect::<Vec<_>>();
 
-            // Remove any cycles.
-            let feedback_set: Vec<EdgeIndex> = petgraph::algo::greedy_feedback_arc_set(&graph)
-                .map(|e| e.id())
-                .collect();
-            for edge_id in feedback_set {
-                if let Some((source, target)) = graph.edge_endpoints(edge_id) {
-                    if let Some(weight) = graph.remove_edge(edge_id) {
-                        edges.push((source, target, weight));
-                    }
-                }
-            }
+                // Sort the roots.
+                roots.sort_by_key(|index| &graph[*index]);
 
-            // Find the root nodes: nodes with no incoming edges, or only an edge from the proxy.
-            let mut roots = graph
-                .node_indices()
-                .filter(|index| {
+                roots
+            } else {
+                let mut roots = if invert {
+                    // For inverted trees, find leaf packages (nodes with no incoming
+                    // edges).
                     graph
-                        .edges_directed(*index, Direction::Incoming)
-                        .next()
-                        .is_none()
-                })
-                .collect::<Vec<_>>();
+                        .node_indices()
+                        .filter(|index| {
+                            graph
+                                .edges_directed(*index, Direction::Incoming)
+                                .next()
+                                .is_none()
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    // For non-inverted trees, use the root node directly.
+                    graph
+                        .node_indices()
+                        .filter(|index| matches!(graph[*index], Node::Root))
+                        .collect::<Vec<_>>()
+                };
 
-            // Sort the roots.
-            roots.sort_by_key(|index| &graph[*index]);
-
-            // Re-add the removed edges.
-            for (source, target, weight) in edges {
-                graph.add_edge(source, target, weight);
+                roots.sort_by_key(|index| &graph[*index]);
+                roots
             }
-
-            roots
         };
 
         Self {
@@ -398,6 +412,9 @@ impl<'env> TreeDisplay<'env> {
             latest,
             depth,
             no_dedupe,
+            invert,
+            lock,
+            show_sizes,
         }
     }
 
@@ -405,8 +422,8 @@ impl<'env> TreeDisplay<'env> {
     fn visit(
         &'env self,
         cursor: Cursor,
-        visited: &mut FxHashMap<&'env PackageId, Vec<&'env PackageId>>,
-        path: &mut Vec<&'env PackageId>,
+        visited: &mut FxHashMap<VisitedNode<'env>, Vec<&'env PackageId>>,
+        path: &mut Vec<VisitedNode<'env>>,
     ) -> Vec<String> {
         // Short-circuit if the current path is longer than the provided depth.
         if path.len() > self.depth {
@@ -417,6 +434,13 @@ impl<'env> TreeDisplay<'env> {
             return Vec::new();
         };
         let edge = cursor.edge().map(|edge_id| &self.graph[edge_id]);
+        let package = self.lock.find_by_id(package_id);
+
+        let expanded_extras = self.expanded_extras(package, edge);
+        let visited_node = VisitedNode {
+            package_id,
+            expanded_extras: expanded_extras.clone(),
+        };
 
         let line = {
             let mut line = format!("{}", package_id.name);
@@ -447,20 +471,33 @@ impl<'env> TreeDisplay<'env> {
                 }
             }
 
+            // Append compressed wheel size, if available in the lockfile.
+            // Keep it simple: use the first wheel entry that includes a size.
+            if self.show_sizes {
+                if let Some(size_bytes) = package.wheels.iter().find_map(|wheel| wheel.size) {
+                    let (bytes, unit) = human_readable_bytes(size_bytes);
+                    line.push(' ');
+                    line.push_str(format!("{}", format!("({bytes:.1}{unit})").dimmed()).as_str());
+                }
+            }
+
             line
         };
 
         // Skip the traversal if:
         // 1. The package is in the current traversal path (i.e., a dependency cycle).
         // 2. The package has been visited and de-duplication is enabled (default).
-        if let Some(requirements) = visited.get(package_id) {
-            if !self.no_dedupe || path.contains(&package_id) {
-                return if requirements.is_empty() {
-                    vec![line]
-                } else {
-                    vec![format!("{line} (*)")]
-                };
-            }
+        if path.contains(&visited_node) {
+            return vec![format!("{line} (*)")];
+        }
+        if !self.no_dedupe
+            && let Some(requirements) = visited.get(&visited_node)
+        {
+            return if requirements.is_empty() {
+                vec![line]
+            } else {
+                vec![format!("{line} (*)")]
+            };
         }
 
         // Incorporate the latest version of the package, if known.
@@ -475,7 +512,18 @@ impl<'env> TreeDisplay<'env> {
             .edges_directed(cursor.node(), Direction::Outgoing)
             .filter_map(|edge| match self.graph[edge.target()] {
                 Node::Root => None,
-                Node::Package(_) => Some(Cursor::new(edge.target(), edge.id())),
+                Node::Package(_) => {
+                    // Only include extra-conditional dependencies if the activating extra is
+                    // enabled in the current context.
+                    if !self.invert
+                        && let Edge::Optional(required_extra, _) = &self.graph[edge.id()]
+                    {
+                        if !expanded_extras.contains(required_extra) {
+                            return None;
+                        }
+                    }
+                    Some(Cursor::new(edge.target(), edge.id()))
+                }
             })
             .collect::<Vec<_>>();
         dependencies.sort_by_key(|cursor| {
@@ -490,17 +538,20 @@ impl<'env> TreeDisplay<'env> {
         let mut lines = vec![line];
 
         // Keep track of the dependency path to avoid cycles.
-        visited.insert(
-            package_id,
-            dependencies
-                .iter()
-                .filter_map(|node| match self.graph[node.node()] {
-                    Node::Package(package_id) => Some(package_id),
-                    Node::Root => None,
-                })
-                .collect(),
-        );
-        path.push(package_id);
+        // Only mark as visited if we're going to expand children (not at depth limit).
+        if path.len() < self.depth {
+            visited.insert(
+                visited_node.clone(),
+                dependencies
+                    .iter()
+                    .filter_map(|node| match self.graph[node.node()] {
+                        Node::Package(package_id) => Some(package_id),
+                        Node::Root => None,
+                    })
+                    .collect(),
+            );
+        }
+        path.push(visited_node);
 
         for (index, dep) in dependencies.iter().enumerate() {
             // For sub-visited packages, add the prefix to make the tree display user-friendly.
@@ -572,6 +623,36 @@ impl<'env> TreeDisplay<'env> {
 
         lines
     }
+
+    /// Return the extras that can change this package's rendered child list.
+    fn expanded_extras(
+        &self,
+        package: &'env Package,
+        edge: Option<&Edge<'env>>,
+    ) -> BTreeSet<&'env ExtraName> {
+        if self.invert {
+            // In inverted mode, optional edges are reverse "required by extra" relationships.
+            // They do not select this package's outgoing dependencies, so de-dupe stays
+            // package-only.
+            return BTreeSet::default();
+        }
+
+        let Some(requested_extras) = edge.and_then(Edge::extras) else {
+            // Roots are rendered with all optional dependency groups expanded.
+            return package.optional_dependencies.keys().collect();
+        };
+
+        requested_extras
+            .iter()
+            .filter(|extra| package.optional_dependencies.contains_key(*extra))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VisitedNode<'env> {
+    package_id: &'env PackageId,
+    expanded_extras: BTreeSet<&'env ExtraName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]

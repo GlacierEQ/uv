@@ -54,6 +54,7 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Generator, Iterable, NamedTuple, Self
+from urllib.parse import unquote
 
 import httpx
 
@@ -142,6 +143,20 @@ class ImplementationName(StrEnum):
 class Variant(StrEnum):
     FREETHREADED = "freethreaded"
     DEBUG = "debug"
+    FREETHREADED_DEBUG = "freethreaded+debug"
+
+    @classmethod
+    def from_build_options(
+        cls: type["Variant"], build_options: list[str]
+    ) -> "Variant | None":
+        if "debug" in build_options and "freethreaded" in build_options:
+            return cls.FREETHREADED_DEBUG
+        elif "debug" in build_options:
+            return cls.DEBUG
+        elif "freethreaded" in build_options:
+            return cls.FREETHREADED
+        else:
+            return None
 
 
 @dataclass
@@ -153,6 +168,7 @@ class PythonDownload:
     implementation: ImplementationName
     filename: str
     url: str
+    build: str
     sha256: str | None = None
     build_options: list[str] = field(default_factory=list)
     variant: Variant | None = None
@@ -175,9 +191,7 @@ class Finder:
 class CPythonFinder(Finder):
     implementation = ImplementationName.CPYTHON
 
-    RELEASE_URL = (
-        "https://api.github.com/repos/astral-sh/python-build-standalone/releases"
-    )
+    NDJSON_URL = "https://releases.astral.sh/github/versions/main/v1/python-build-standalone.ndjson"
 
     FLAVOR_PREFERENCES = [
         "install_only_stripped",
@@ -186,86 +200,52 @@ class CPythonFinder(Finder):
         "shared-noopt",
         "static-noopt",
     ]
-    SPECIAL_TRIPLES = {
-        "macos": "x86_64-apple-darwin",
-        "linux64": "x86_64-unknown-linux-gnu",
-        "windows-amd64": "x86_64-pc-windows",
-        "windows-x86": "i686-pc-windows",
-        "windows-amd64-shared": "x86_64-pc-windows",
-        "windows-x86-shared": "i686-pc-windows",
-        "linux64-musl": "x86_64-unknown-linux-musl",
-    }
     # Normalized mappings to match the Rust types
     ARCH_MAP = {
         "ppc64": "powerpc64",
         "ppc64le": "powerpc64le",
     }
-
-    _filename_re = re.compile(
-        r"""(?x)
-        ^
-            cpython-
-            (?P<ver>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)(?:\+\d+)?\+
-            (?P<date>\d+)-
-            (?P<triple>[a-z\d_]+-[a-z\d]+(?>-[a-z\d]+)?-[a-z\d]+)-
-            (?:(?P<build_options>.+)-)?
-            (?P<flavor>[a-z_]+)?
-            \.tar\.(?:gz|zst)
-        $
-        """
-    )
-
-    _legacy_filename_re = re.compile(
-        r"""(?x)
-        ^
-            cpython-
-            (?P<ver>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)(?:\+\d+)?-
-            (?P<triple>[a-z\d_-]+)-
-            (?P<build_options>(debug|pgo|noopt|lto|pgo\+lto))?-
-            (?P<date>[a-zA-z\d]+)
-            \.tar\.(?:gz|zst)
-        $
-        """
-    )
+    # Terminal flavor keywords used as the last component of an NDJSON variant string.
+    # All preceding "+" components are treated as build options.
+    KNOWN_FLAVORS = frozenset({"full", "install_only", "install_only_stripped"})
 
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
 
     async def find(self) -> list[PythonDownload]:
-        downloads = await self._fetch_downloads()
-        await self._fetch_checksums(downloads, n=20)
-        return downloads
+        return await self._fetch_downloads()
 
-    async def _fetch_downloads(self, pages: int = 100) -> list[PythonDownload]:
-        """Fetch all the indygreg downloads from the release API."""
+    async def _fetch_downloads(self) -> list[PythonDownload]:
+        """Fetch all CPython downloads from the NDJSON release index."""
+        logging.info("Fetching CPython release index")
+        resp = await self.client.get(self.NDJSON_URL)
+        resp.raise_for_status()
+
         downloads_by_version: dict[Version, list[PythonDownload]] = {}
 
-        # Collect all available Python downloads
-        for page in range(1, pages + 1):
-            logging.info("Fetching CPython release page %d", page)
-            resp = await self.client.get(
-                self.RELEASE_URL, params={"page": page, "per_page": 10}
-            )
-            resp.raise_for_status()
-            rows = resp.json()
-            if not rows:
-                break
-            for row in rows:
-                # Sort the assets to ensure deterministic results
-                row["assets"].sort(key=lambda asset: asset["browser_download_url"])
-                for asset in row["assets"]:
-                    download = self._parse_download_asset(asset)
-                    if download is None:
-                        continue
-                    if (
-                        download.release < CPYTHON_MUSL_STATIC_RELEASE_END
-                        and download.triple.libc == "musl"
-                    ):
-                        continue
-                    logging.debug("Found %s (%s)", download.key(), download.filename)
-                    downloads_by_version.setdefault(download.version, []).append(
-                        download
-                    )
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            record = json.loads(line)
+            # Parse "3.11.15+20260303" → version="3.11.15", release=20260303
+            version_str, _, date_str = record["version"].partition("+")
+            version = Version.from_str(version_str)
+            release = int(date_str)
+
+            # Sort artifacts to ensure deterministic results
+            for artifact in sorted(record["artifacts"], key=lambda a: a["url"]):
+                download = self._parse_ndjson_artifact(version, release, artifact)
+                if download is None:
+                    continue
+                if (
+                    download.release < CPYTHON_MUSL_STATIC_RELEASE_END
+                    and download.triple.libc == "musl"
+                ):
+                    continue
+                logging.debug("Found %s (%s)", download.key(), download.filename)
+                downloads_by_version.setdefault(download.version, []).append(download)
 
         # Collapse CPython variants to a single flavor per triple and variant
         downloads = []
@@ -299,95 +279,40 @@ class CPythonFinder(Finder):
 
         return downloads
 
-    async def _fetch_checksums(self, downloads: list[PythonDownload], n: int) -> None:
-        """Fetch the checksums for the given downloads."""
-        checksum_urls = set()
-        for download in downloads:
-            # Skip the newer releases where we got the hash from the GitHub API
-            if download.sha256:
-                continue
-            release_base_url = download.url.rsplit("/", maxsplit=1)[0]
-            checksum_url = release_base_url + "/SHA256SUMS"
-            checksum_urls.add(checksum_url)
+    def _parse_ndjson_artifact(
+        self, version: Version, release: int, artifact: dict[str, Any]
+    ) -> PythonDownload | None:
+        """Parse a single NDJSON artifact entry into a PythonDownload."""
+        url = artifact["url"]
+        sha256 = artifact.get("sha256")
+        filename = unquote(url.rsplit("/", maxsplit=1)[-1])
 
-        async def fetch_checksums(url: str) -> httpx.Response | None:
-            try:
-                resp = await self.client.get(url)
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    return None
-                raise
-            return resp
+        platform_str = artifact["platform"]
+        variant_str = artifact["variant"]
 
-        completed = 0
-        tasks = []
-        for batch in batched(checksum_urls, n):
-            logging.info(
-                "Fetching CPython checksums: %d/%d", completed, len(checksum_urls)
-            )
-            async with asyncio.TaskGroup() as tg:
-                for url in batch:
-                    task = tg.create_task(fetch_checksums(url))
-                    tasks.append(task)
-            completed += n
+        # On macOS, some builds encode build options as platform suffixes
+        # rather than variant components (e.g. "aarch64-apple-darwin-debug",
+        # "aarch64-apple-darwin-freethreaded"). Strip them and promote to
+        # build options.
+        platform_build_options: list[str] = []
+        for suffix in ("-debug", "-freethreaded"):
+            if platform_str.endswith(suffix):
+                platform_str = platform_str[: -len(suffix)]
+                platform_build_options.append(suffix.lstrip("-"))
 
-        checksums = {}
-        for task in tasks:
-            resp = task.result()
-            if resp is None:
-                continue
-            lines = resp.text.splitlines()
-            for line in lines:
-                checksum, filename = line.split(" ", maxsplit=1)
-                filename = filename.strip()
-                checksums[filename] = checksum
+        flavor, variant_build_options = self._parse_variant(variant_str)
+        build_options = platform_build_options + variant_build_options
 
-        for download in downloads:
-            if download.sha256:
-                continue
-            download.sha256 = checksums.get(download.filename)
-
-    def _parse_download_asset(self, asset: dict[str, Any]) -> PythonDownload | None:
-        """Parse a python-build-standalone download asset into a PythonDownload object."""
-        url = asset["browser_download_url"]
-        # Ex)
-        # https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.12.1%2B20240107-aarch64-unknown-linux-gnu-lto-full.tar.zst
-        if url.endswith(".sha256"):
-            return None
-        release = int(url.rsplit("/")[-2])
-        filename = asset["name"]
-        sha256 = None
-        # On older versions, GitHub didn't backfill the digest.
-        if digest := asset["digest"]:
-            sha256 = digest.removeprefix("sha256:")
-
-        match = self._filename_re.match(filename) or self._legacy_filename_re.match(
-            filename
-        )
-        if match is None:
-            logging.debug("Skipping %s: no regex match", filename)
+        # Skip static builds (not supported)
+        if "static" in build_options:
+            logging.debug("Skipping %s: static unsupported", filename)
             return None
 
-        groups = match.groupdict()
-        version = groups["ver"]
-        triple = groups["triple"]
-        build_options = groups.get("build_options")
-        flavor = groups.get("flavor", "full")
-
-        build_options = build_options.split("+") if build_options else []
-        variant: Variant | None
-        for variant in Variant:
-            if variant in build_options:
-                break
-        else:
-            variant = None
-
-        version = Version.from_str(version)
-        triple = self._normalize_triple(triple)
+        triple = self._normalize_triple(platform_str)
         if triple is None:
-            # Skip is logged in `_normalize_triple`
             return None
+
+        variant = Variant.from_build_options(build_options)
 
         return PythonDownload(
             release=release,
@@ -397,17 +322,31 @@ class CPythonFinder(Finder):
             implementation=self.implementation,
             filename=filename,
             url=url,
+            build=str(release),
             build_options=build_options,
             variant=variant,
             sha256=sha256,
         )
 
-    def _normalize_triple(self, triple: str) -> PlatformTriple | None:
-        if "-static" in triple:
-            logging.debug("Skipping %r: static unsupported", triple)
-            return None
+    def _parse_variant(self, variant_str: str) -> tuple[str, list[str]]:
+        """Split an NDJSON variant string into (flavor, build_options).
 
-        triple = self.SPECIAL_TRIPLES.get(triple, triple)
+        The variant field uses "+" as separator. The last component is the
+        flavor when it is a known terminal keyword; everything preceding it
+        is a build option that may affect priority or variant classification.
+        Examples:
+          "install_only_stripped"   → ("install_only_stripped", [])
+          "pgo+lto+full"            → ("full", ["pgo", "lto"])
+          "freethreaded+debug+full" → ("full", ["freethreaded", "debug"])
+          "static-noopt+full"       → ("full", ["static-noopt"])
+        """
+        parts = variant_str.split("+")
+        if parts[-1] in self.KNOWN_FLAVORS:
+            return parts[-1], parts[:-1]
+        # Whole string is itself a flavor (e.g. "install_only_stripped" has no "+")
+        return variant_str, []
+
+    def _normalize_triple(self, triple: str) -> PlatformTriple | None:
         pieces = triple.split("-")
         try:
             arch = self._normalize_arch(pieces[0])
@@ -507,6 +446,7 @@ class PyPyFinder(Finder):
             python_version = Version.from_str(version["python_version"])
             if python_version < (3, 7, 0):
                 continue
+            pypy_version = version["pypy_version"]
             for file in version["files"]:
                 arch = self._normalize_arch(file["arch"])
                 platform = self._normalize_os(file["platform"])
@@ -523,6 +463,7 @@ class PyPyFinder(Finder):
                     implementation=self.implementation,
                     filename=file["filename"],
                     url=file["download_url"],
+                    build=pypy_version,
                 )
                 # Only keep the latest pypy version of each arch/platform
                 if (python_version, arch, platform) not in results:
@@ -553,7 +494,7 @@ class PyPyFinder(Finder):
 class PyodideFinder(Finder):
     implementation = ImplementationName.CPYTHON
 
-    RELEASE_URL = "https://api.github.com/repos/pyodide/pyodide/releases"
+    RELEASE_URL = "https://api.github.com/repos/pyodide/pyodide/releases?per_page=100"
     METADATA_URL = (
         "https://pyodide.github.io/pyodide/api/pyodide-cross-build-environments.json"
     )
@@ -573,49 +514,60 @@ class PyodideFinder(Finder):
         return downloads
 
     async def _fetch_downloads(self) -> list[PythonDownload]:
-        # This will only download the first page, i.e., ~30 releases
-        [release_resp, meta_resp] = await asyncio.gather(
-            self.client.get(self.RELEASE_URL), self.client.get(self.METADATA_URL)
-        )
-        release_resp.raise_for_status()
+        meta_resp = await self.client.get(self.METADATA_URL)
         meta_resp.raise_for_status()
-        releases = release_resp.json()
         metadata = meta_resp.json()["releases"]
 
-        maj_minor_seen = set()
-        results = []
+        # Paginate through all pages of releases via the Link header
+        releases = []
+        release_url: str | None = self.RELEASE_URL
+        while release_url is not None:
+            resp = await self.client.get(release_url)
+            resp.raise_for_status()
+            releases.extend(resp.json())
+            next_link = resp.links.get("next", {})
+            release_url = next_link.get("url")
+
+        results = {}
         for release in releases:
+            # Skip prereleases
+            # https://github.com/astral-sh/uv/pull/18958#discussion_r3082735525
+            if release.get("prerelease"):
+                continue
+
             pyodide_version = release["tag_name"]
             meta = metadata.get(pyodide_version, None)
             if meta is None:
                 continue
 
-            maj_min = pyodide_version.rpartition(".")[0]
-            # Only keep latest
-            if maj_min in maj_minor_seen:
-                continue
-            maj_minor_seen.add(maj_min)
-
             python_version = Version.from_str(meta["python_version"])
+
             # Find xbuildenv asset
             for asset in release["assets"]:
                 if asset["name"].startswith("xbuildenv"):
                     break
+            else:
+                # not found: should not happen but just in case
+                continue
 
             url = asset["browser_download_url"]
-            results.append(
-                PythonDownload(
-                    release=0,
-                    version=python_version,
-                    triple=self.TRIPLE,
-                    flavor=pyodide_version,
-                    implementation=self.implementation,
-                    filename=asset["name"],
-                    url=url,
-                )
+            download = PythonDownload(
+                release=0,
+                version=python_version,
+                triple=self.TRIPLE,
+                flavor=pyodide_version,
+                implementation=self.implementation,
+                filename=asset["name"],
+                url=url,
+                build=pyodide_version,
             )
 
-        return results
+            # Only keep latest Pyodide version of each Python version
+            # arch/platform are all the same for Pyodide (wasm32, emscripten)
+            if python_version not in results:
+                results[python_version] = download
+
+        return list(results.values())
 
     async def _fetch_checksums(self, downloads: list[PythonDownload], n: int) -> None:
         for idx, batch in enumerate(batched(downloads, n)):
@@ -708,6 +660,7 @@ class GraalPyFinder(Finder):
                     implementation=self.implementation,
                     filename=asset["name"],
                     url=url,
+                    build=graalpy_version,
                     sha256=sha256,
                 )
                 # Only keep the latest GraalPy version of each arch/platform
@@ -760,8 +713,10 @@ def render(downloads: list[PythonDownload]) -> None:
         match variant:
             case Variant.FREETHREADED:
                 return 1
-            case Variant.DEBUG:
+            case Variant.FREETHREADED_DEBUG:
                 return 2
+            case Variant.DEBUG:
+                return 3
         raise ValueError(f"Missing sort key implementation for variant: {variant}")
 
     def sort_key(download: PythonDownload) -> tuple:
@@ -811,11 +766,12 @@ def render(downloads: list[PythonDownload]) -> None:
             "url": download.url,
             "sha256": download.sha256,
             "variant": download.variant if download.variant else None,
+            "build": download.build,
         }
 
     VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Make newlines consistent across platforms
-    VERSIONS_FILE.write_text(json.dumps(results, indent=2), newline="\n")
+    VERSIONS_FILE.write_text(json.dumps(results, indent=2) + "\n", newline="\n")
 
 
 async def find() -> None:

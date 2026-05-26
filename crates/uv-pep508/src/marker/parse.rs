@@ -72,7 +72,7 @@ fn parse_marker_operator<T: Pep508Url>(
 /// '`os_name`', '`sys_platform`', '`platform_release`', '`platform_system`', '`platform_version`',
 /// '`platform_machine`', '`platform_python_implementation`', '`implementation_name`',
 /// '`implementation_version`', 'extra'
-pub(crate) fn parse_marker_value<T: Pep508Url>(
+fn parse_marker_value<T: Pep508Url>(
     cursor: &mut Cursor,
     reporter: &mut impl Reporter,
 ) -> Result<MarkerValue, Pep508Error<T>> {
@@ -607,7 +607,7 @@ fn parse_marker_or<T: Pep508Url>(
 }
 
 /// Parses both `marker_and` and `marker_or`
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn parse_marker_op<T: Pep508Url, R: Reporter>(
     cursor: &mut Cursor,
     op: &str,

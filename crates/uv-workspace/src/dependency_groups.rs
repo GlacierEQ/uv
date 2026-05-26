@@ -3,7 +3,6 @@ use std::str::FromStr;
 use std::{collections::BTreeMap, path::Path};
 
 use thiserror::Error;
-use tracing::error;
 
 use uv_distribution_types::RequiresPython;
 use uv_fs::Simplified;
@@ -253,7 +252,7 @@ impl IntoIterator for FlatDependencyGroups {
 #[derive(Debug, Error)]
 #[error("{} has malformed dependency groups", if path.is_empty() && package.is_empty() {
     "Project".to_string()
-} else if path.is_empty() {
+} else if path.is_empty() || path == "." {
     format!("Project `{package}`")
 } else if package.is_empty() {
     format!("`{path}`")
@@ -268,7 +267,7 @@ pub struct DependencyGroupError {
 }
 
 #[derive(Debug, Error)]
-pub enum DependencyGroupErrorInner {
+enum DependencyGroupErrorInner {
     #[error("Failed to parse entry in group `{0}`: `{1}`")]
     GroupParseError(
         GroupName,
@@ -296,7 +295,7 @@ pub enum DependencyGroupErrorInner {
 impl DependencyGroupErrorInner {
     /// Enrich a [`DependencyGroupError`] with the `tool.uv.dev-dependencies` metadata, if applicable.
     #[must_use]
-    pub fn with_dev_dependencies(
+    fn with_dev_dependencies(
         self,
         dev_dependencies: Option<&Vec<uv_pep508::Requirement<VerbatimParsedUrl>>>,
     ) -> Self {
@@ -318,7 +317,7 @@ impl DependencyGroupErrorInner {
 
 /// A cycle in the `dependency-groups` table.
 #[derive(Debug)]
-pub struct Cycle(Vec<GroupName>);
+struct Cycle(Vec<GroupName>);
 
 /// Display a cycle, e.g., `a -> b -> c -> a`.
 impl std::fmt::Display for Cycle {

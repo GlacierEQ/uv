@@ -5,15 +5,18 @@ use fs_err::File;
 use itertools::{Either, Itertools};
 use owo_colors::OwoColorize;
 use rustc_hash::FxHashMap;
+use tracing::debug;
 
 use uv_cache::Cache;
-use uv_configuration::Preview;
-use uv_distribution_types::{Diagnostic, Name};
+use uv_distribution_types::{DependencyMetadata, Diagnostic, Name};
 use uv_fs::Simplified;
-use uv_install_wheel::read_record_file;
+use uv_install_wheel::read_record;
 use uv_installer::SitePackages;
 use uv_normalize::PackageName;
-use uv_python::{EnvironmentPreference, PythonEnvironment, PythonPreference, PythonRequest};
+use uv_preview::Preview;
+use uv_python::{
+    EnvironmentPreference, Prefix, PythonEnvironment, PythonPreference, PythonRequest, Target,
+};
 
 use crate::commands::ExitStatus;
 use crate::commands::pip::operations::report_target_environment;
@@ -23,15 +26,17 @@ use crate::printer::Printer;
 pub(crate) fn pip_show(
     mut packages: Vec<PackageName>,
     strict: bool,
+    dependency_metadata: &DependencyMetadata,
     python: Option<&str>,
     system: bool,
+    target: Option<Target>,
+    prefix: Option<Prefix>,
     files: bool,
     cache: &Cache,
     printer: Printer,
     preview: Preview,
 ) -> Result<ExitStatus> {
     if packages.is_empty() {
-        #[allow(clippy::print_stderr)]
         {
             writeln!(
                 printer.stderr(),
@@ -52,13 +57,31 @@ pub(crate) fn pip_show(
         preview,
     )?;
 
+    // Apply any `--target` or `--prefix` directories.
+    let environment = if let Some(target) = target {
+        debug!(
+            "Using `--target` directory at {}",
+            target.root().user_display()
+        );
+        environment.with_target(target)?
+    } else if let Some(prefix) = prefix {
+        debug!(
+            "Using `--prefix` directory at {}",
+            prefix.root().user_display()
+        );
+        environment.with_prefix(prefix)?
+    } else {
+        environment
+    };
+
     report_target_environment(&environment, cache, printer)?;
 
     // Build the installed index.
     let site_packages = SitePackages::from_environment(&environment)?;
 
-    // Determine the markers to use for resolution.
+    // Determine the markers and tags to use for resolution.
     let markers = environment.interpreter().resolver_marker_environment();
+    let tags = environment.interpreter().tags()?;
 
     // Sort and deduplicate the packages, which are keyed by name.
     packages.sort_unstable();
@@ -101,9 +124,11 @@ pub(crate) fn pip_show(
         if let Ok(metadata) = dist.read_metadata() {
             requires_map.insert(
                 dist.name(),
-                Box::into_iter(metadata.requires_dist)
+                metadata
+                    .requires_dist
+                    .iter()
                     .filter(|req| req.evaluate_markers(&markers, &[]))
-                    .map(|req| req.name)
+                    .map(|req| &req.name)
                     .sorted_unstable()
                     .dedup()
                     .collect_vec(),
@@ -117,9 +142,11 @@ pub(crate) fn pip_show(
                 continue;
             }
             if let Ok(metadata) = installed.read_metadata() {
-                let requires = Box::into_iter(metadata.requires_dist)
+                let requires = metadata
+                    .requires_dist
+                    .iter()
                     .filter(|req| req.evaluate_markers(&markers, &[]))
-                    .map(|req| req.name)
+                    .map(|req| &req.name)
                     .collect_vec();
                 if !requires.is_empty() {
                     requires_map.insert(installed.name(), requires);
@@ -171,7 +198,7 @@ pub(crate) fn pip_show(
                 .iter()
                 .filter(|(name, pkgs)| {
                     **name != distribution.name()
-                        && pkgs.iter().any(|pkg| pkg == distribution.name())
+                        && pkgs.iter().any(|pkg| *pkg == distribution.name())
                 })
                 .map(|(name, _)| name)
                 .sorted_unstable()
@@ -191,7 +218,7 @@ pub(crate) fn pip_show(
         // If requests, show the list of installed files.
         if files {
             let path = distribution.install_path().join("RECORD");
-            let record = read_record_file(&mut File::open(path)?)?;
+            let record = read_record(&mut File::open(path)?)?;
             writeln!(printer.stdout(), "Files:")?;
             for entry in record {
                 writeln!(printer.stdout(), "  {}", entry.path)?;
@@ -201,7 +228,7 @@ pub(crate) fn pip_show(
 
     // Validate that the environment is consistent.
     if strict {
-        for diagnostic in site_packages.diagnostics(&markers)? {
+        for diagnostic in site_packages.diagnostics(&markers, tags, dependency_metadata)? {
             writeln!(
                 printer.stderr(),
                 "{}{} {}",

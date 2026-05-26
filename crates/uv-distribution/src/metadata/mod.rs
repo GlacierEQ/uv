@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use uv_configuration::SourceStrategy;
-use uv_distribution_types::{GitSourceUrl, IndexLocations, Requirement};
+use uv_auth::CredentialsCache;
+use uv_configuration::NoSources;
+use uv_distribution_types::{GitDirectorySourceUrl, IndexLocations, Requirement};
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::{Version, VersionSpecifiers};
 use uv_pypi_types::{HashDigests, ResolutionMetadata};
@@ -28,6 +29,8 @@ pub enum MetadataError {
     Workspace(#[from] WorkspaceError),
     #[error(transparent)]
     DependencyGroup(#[from] DependencyGroupError),
+    #[error("No pyproject.toml found at: {0}")]
+    MissingPyprojectToml(PathBuf),
     #[error("Failed to parse entry: `{0}`")]
     LoweringError(PackageName, #[source] Box<LoweringError>),
     #[error("Failed to parse entry in group `{0}`: `{1}`")]
@@ -50,6 +53,15 @@ pub enum MetadataError {
     IncompleteSourceGroup(PackageName, GroupName),
 }
 
+impl uv_errors::Hint for MetadataError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        match self {
+            Self::LoweringError(_, err) | Self::GroupLoweringError(_, _, err) => err.hints(),
+            _ => uv_errors::Hints::none(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Metadata {
     // Mandatory fields
@@ -58,7 +70,7 @@ pub struct Metadata {
     // Optional fields
     pub requires_dist: Box<[Requirement]>,
     pub requires_python: Option<VersionSpecifiers>,
-    pub provides_extras: Box<[ExtraName]>,
+    pub provides_extra: Box<[ExtraName]>,
     pub dependency_groups: BTreeMap<GroupName, Box<[Requirement]>>,
     pub dynamic: bool,
 }
@@ -74,7 +86,7 @@ impl Metadata {
                 .map(Requirement::from)
                 .collect(),
             requires_python: metadata.requires_python,
-            provides_extras: metadata.provides_extras,
+            provides_extra: metadata.provides_extra,
             dependency_groups: BTreeMap::default(),
             dynamic: metadata.dynamic,
         }
@@ -87,20 +99,22 @@ impl Metadata {
         install_path: &Path,
         git_source: Option<&GitWorkspaceMember<'_>>,
         locations: &IndexLocations,
-        sources: SourceStrategy,
+        sources: NoSources,
+        editable: bool,
         cache: &WorkspaceCache,
+        credentials_cache: &CredentialsCache,
     ) -> Result<Self, MetadataError> {
         // Lower the requirements.
         let requires_dist = uv_pypi_types::RequiresDist {
             name: metadata.name,
             requires_dist: metadata.requires_dist,
-            provides_extras: metadata.provides_extras,
+            provides_extra: metadata.provides_extra,
             dynamic: metadata.dynamic,
         };
         let RequiresDist {
             name,
             requires_dist,
-            provides_extras,
+            provides_extra,
             dependency_groups,
             dynamic,
         } = RequiresDist::from_project_maybe_workspace(
@@ -109,7 +123,9 @@ impl Metadata {
             git_source,
             locations,
             sources,
+            editable,
             cache,
+            credentials_cache,
         )
         .await?;
 
@@ -119,7 +135,7 @@ impl Metadata {
             version: metadata.version,
             requires_dist,
             requires_python: metadata.requires_python,
-            provides_extras,
+            provides_extra,
             dependency_groups,
             dynamic,
         })
@@ -161,5 +177,5 @@ pub struct GitWorkspaceMember<'a> {
     /// The root of the checkout, which may be the root of the workspace or may be above the
     /// workspace root.
     pub fetch_root: &'a Path,
-    pub git_source: &'a GitSourceUrl<'a>,
+    pub git_source: &'a GitDirectorySourceUrl<'a>,
 }

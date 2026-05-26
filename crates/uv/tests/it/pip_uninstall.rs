@@ -1,18 +1,15 @@
-use std::process::Command;
-
 use anyhow::Result;
 use assert_cmd::prelude::*;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 
-use crate::common::{TestContext, get_bin, uv_snapshot};
+use uv_test::uv_snapshot;
 
 #[test]
 fn no_arguments() {
-    uv_snapshot!(Command::new(get_bin())
-        .arg("pip")
-        .arg("uninstall")
-        .env_clear(), @r###"
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.pip_uninstall(), @"
     success: false
     exit_code: 2
     ----- stdout -----
@@ -21,22 +18,19 @@ fn no_arguments() {
     error: the following required arguments were not provided:
       <PACKAGE|--requirements <REQUIREMENTS>>
 
-    Usage: uv pip uninstall <PACKAGE|--requirements <REQUIREMENTS>>
+    Usage: uv pip uninstall --cache-dir [CACHE_DIR] <PACKAGE|--requirements <REQUIREMENTS>>
 
     For more information, try '--help'.
-    "###
+    "
     );
 }
 
 #[test]
-fn invalid_requirement() -> Result<()> {
-    let temp_dir = assert_fs::TempDir::new()?;
+fn invalid_requirement() {
+    let context = uv_test::test_context!("3.12");
 
-    uv_snapshot!(Command::new(get_bin())
-        .arg("pip")
-        .arg("uninstall")
-        .arg("flask==1.0.x")
-        .current_dir(&temp_dir), @r###"
+    uv_snapshot!(context.filters(), context.pip_uninstall()
+        .arg("flask==1.0.x"), @"
     success: false
     exit_code: 2
     ----- stdout -----
@@ -46,45 +40,36 @@ fn invalid_requirement() -> Result<()> {
       Caused by: after parsing `1.0`, found `.x`, which is not part of a valid version
     flask==1.0.x
          ^^^^^^^
-    "###);
-
-    Ok(())
+    ");
 }
 
 #[test]
-fn missing_requirements_txt() -> Result<()> {
-    let temp_dir = assert_fs::TempDir::new()?;
+fn missing_requirements_txt() {
+    let context = uv_test::test_context!("3.12");
 
-    uv_snapshot!(Command::new(get_bin())
-        .arg("pip")
-        .arg("uninstall")
+    uv_snapshot!(context.filters(), context.pip_uninstall()
         .arg("-r")
-        .arg("requirements.txt")
-        .current_dir(&temp_dir), @r###"
+        .arg("requirements.txt"), @"
     success: false
     exit_code: 2
     ----- stdout -----
 
     ----- stderr -----
     error: File not found: `requirements.txt`
-    "###
+    "
     );
-
-    Ok(())
 }
 
 #[test]
 fn invalid_requirements_txt_requirement() -> Result<()> {
-    let temp_dir = assert_fs::TempDir::new()?;
-    let requirements_txt = temp_dir.child("requirements.txt");
+    let context = uv_test::test_context!("3.12");
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("flask==1.0.x")?;
 
-    uv_snapshot!(Command::new(get_bin())
-        .arg("pip")
-        .arg("uninstall")
+    uv_snapshot!(context.filters(), context.pip_uninstall()
         .arg("-r")
-        .arg("requirements.txt")
-        .current_dir(&temp_dir), @r###"
+        .arg("requirements.txt"), @"
     success: false
     exit_code: 2
     ----- stdout -----
@@ -94,15 +79,15 @@ fn invalid_requirements_txt_requirement() -> Result<()> {
       Caused by: after parsing `1.0`, found `.x`, which is not part of a valid version
     flask==1.0.x
          ^^^^^^^
-    "###);
+    ");
 
     Ok(())
 }
 
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn uninstall() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("MarkupSafe==2.1.3")?;
@@ -116,7 +101,7 @@ fn uninstall() -> Result<()> {
     context.assert_command("import markupsafe").success();
 
     uv_snapshot!(context.pip_uninstall()
-        .arg("MarkupSafe"), @r###"
+        .arg("MarkupSafe"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -124,7 +109,7 @@ fn uninstall() -> Result<()> {
     ----- stderr -----
     Uninstalled 1 package in [TIME]
      - markupsafe==2.1.3
-    "###
+    "
     );
 
     context.assert_command("import markupsafe").failure();
@@ -133,9 +118,9 @@ fn uninstall() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn missing_record() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("MarkupSafe==2.1.3")?;
@@ -153,7 +138,7 @@ fn missing_record() -> Result<()> {
     fs_err::remove_file(dist_info.join("RECORD"))?;
 
     uv_snapshot!(context.filters(), context.pip_uninstall()
-        .arg("MarkupSafe"), @r"
+        .arg("MarkupSafe"), @"
     success: false
     exit_code: 2
     ----- stdout -----
@@ -167,16 +152,16 @@ fn missing_record() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn uninstall_editable_by_name() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(&format!(
         "-e {}",
         context
             .workspace_root
-            .join("scripts/packages/flit_editable")
+            .join("test/packages/flit_editable")
             .as_os_str()
             .to_str()
             .expect("Path is valid unicode")
@@ -191,15 +176,15 @@ fn uninstall_editable_by_name() -> Result<()> {
 
     // Uninstall the editable by name.
     uv_snapshot!(context.filters(), context.pip_uninstall()
-        .arg("flit-editable"), @r###"
+        .arg("flit-editable"), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
     Uninstalled 1 package in [TIME]
-     - flit-editable==0.1.0 (from file://[WORKSPACE]/scripts/packages/flit_editable)
-    "###
+     - flit-editable==0.1.0 (from file://[WORKSPACE]/test/packages/flit_editable)
+    "
     );
 
     context.assert_command("import flit_editable").failure();
@@ -208,15 +193,15 @@ fn uninstall_editable_by_name() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn uninstall_by_path() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(
         context
             .workspace_root
-            .join("scripts/packages/flit_editable")
+            .join("test/packages/flit_editable")
             .as_os_str()
             .to_str()
             .expect("Path is valid unicode"),
@@ -232,15 +217,15 @@ fn uninstall_by_path() -> Result<()> {
 
     // Uninstall the editable by path.
     uv_snapshot!(context.filters(), context.pip_uninstall()
-        .arg(context.workspace_root.join("scripts/packages/flit_editable")), @r###"
+        .arg(context.workspace_root.join("test/packages/flit_editable")), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
     Uninstalled 1 package in [TIME]
-     - flit-editable==0.1.0 (from file://[WORKSPACE]/scripts/packages/flit_editable)
-    "###
+     - flit-editable==0.1.0 (from file://[WORKSPACE]/test/packages/flit_editable)
+    "
     );
 
     context.assert_command("import flit_editable").failure();
@@ -249,15 +234,15 @@ fn uninstall_by_path() -> Result<()> {
 }
 
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn uninstall_duplicate_by_path() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str(
         context
             .workspace_root
-            .join("scripts/packages/flit_editable")
+            .join("test/packages/flit_editable")
             .as_os_str()
             .to_str()
             .expect("Path is valid unicode"),
@@ -274,15 +259,15 @@ fn uninstall_duplicate_by_path() -> Result<()> {
     // Uninstall the editable by both path and name.
     uv_snapshot!(context.filters(), context.pip_uninstall()
         .arg("flit-editable")
-        .arg(context.workspace_root.join("scripts/packages/flit_editable")), @r###"
+        .arg(context.workspace_root.join("test/packages/flit_editable")), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
     Uninstalled 1 package in [TIME]
-     - flit-editable==0.1.0 (from file://[WORKSPACE]/scripts/packages/flit_editable)
-    "###
+     - flit-editable==0.1.0 (from file://[WORKSPACE]/test/packages/flit_editable)
+    "
     );
 
     context.assert_command("import flit_editable").failure();
@@ -292,12 +277,12 @@ fn uninstall_duplicate_by_path() -> Result<()> {
 
 /// Uninstall a duplicate package in a virtual environment.
 #[test]
-#[cfg(feature = "pypi")]
+#[cfg(feature = "test-pypi")]
 fn uninstall_duplicate() -> Result<()> {
     use uv_fs::copy_dir_all;
 
     // Sync a version of `pip` into a virtual environment.
-    let context1 = TestContext::new("3.12");
+    let context1 = uv_test::test_context!("3.12");
     let requirements_txt = context1.temp_dir.child("requirements.txt");
     requirements_txt.write_str("pip==21.3.1")?;
 
@@ -309,7 +294,7 @@ fn uninstall_duplicate() -> Result<()> {
         .success();
 
     // Sync a different version of `pip` into a virtual environment.
-    let context2 = TestContext::new("3.12");
+    let context2 = uv_test::test_context!("3.12");
     let requirements_txt = context2.temp_dir.child("requirements.txt");
     requirements_txt.write_str("pip==22.1.1")?;
 
@@ -328,7 +313,7 @@ fn uninstall_duplicate() -> Result<()> {
 
     // Run `pip uninstall`.
     uv_snapshot!(context1.pip_uninstall()
-        .arg("pip"), @r###"
+        .arg("pip"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -337,7 +322,7 @@ fn uninstall_duplicate() -> Result<()> {
     Uninstalled 2 packages in [TIME]
      - pip==21.3.1
      - pip==22.1.1
-    "###
+    "
     );
 
     Ok(())
@@ -346,7 +331,7 @@ fn uninstall_duplicate() -> Result<()> {
 /// Uninstall a `.egg-info` package in a virtual environment.
 #[test]
 fn uninstall_egg_info() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let site_packages = ChildPath::new(context.site_packages());
 
@@ -384,7 +369,7 @@ fn uninstall_egg_info() -> Result<()> {
 
     // Run `pip uninstall`.
     uv_snapshot!(context.pip_uninstall()
-        .arg("zstandard"), @r###"
+        .arg("zstandard"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -392,7 +377,7 @@ fn uninstall_egg_info() -> Result<()> {
     ----- stderr -----
     Uninstalled 1 package in [TIME]
      - zstandard==0.22.0
-    "###);
+    ");
 
     Ok(())
 }
@@ -408,7 +393,7 @@ fn normcase(s: &str) -> String {
 /// Uninstall a legacy editable package in a virtual environment.
 #[test]
 fn uninstall_legacy_editable() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let site_packages = ChildPath::new(context.site_packages());
 
@@ -438,7 +423,7 @@ Version: 0.22.0
 
     // Run `pip uninstall`.
     uv_snapshot!(context.pip_uninstall()
-        .arg("zstandard"), @r###"
+        .arg("zstandard"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -446,7 +431,7 @@ Version: 0.22.0
     ----- stderr -----
     Uninstalled 1 package in [TIME]
      - zstandard==0.22.0
-    "###);
+    ");
 
     // The entry in `easy-install.pth` should be removed.
     assert_eq!(
@@ -464,7 +449,7 @@ Version: 0.22.0
 
 #[test]
 fn dry_run_uninstall_egg_info() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let site_packages = ChildPath::new(context.site_packages());
 
@@ -503,7 +488,7 @@ fn dry_run_uninstall_egg_info() -> Result<()> {
     // Run `pip uninstall`.
     uv_snapshot!(context.pip_uninstall()
         .arg("--dry-run")
-        .arg("zstandard"), @r###"
+        .arg("zstandard"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -511,7 +496,7 @@ fn dry_run_uninstall_egg_info() -> Result<()> {
     ----- stderr -----
     Would uninstall 1 package
      - zstandard==0.22.0
-    "###);
+    ");
 
     // The `.egg-info` directory should still exist.
     assert!(
@@ -523,4 +508,170 @@ fn dry_run_uninstall_egg_info() -> Result<()> {
     assert!(site_packages.child("zstd").child("__init__.py").exists());
 
     Ok(())
+}
+
+/// Uninstall must not remove files outside the install scheme.
+///
+/// A malformed or malicious wheel can include path-traversal entries
+/// (e.g. `../../../../../etc/passwd`) in its RECORD file. During uninstall those entries are joined
+/// with the site-packages directory and could cause deletion of files outside the installation
+/// scheme.
+#[test]
+fn uninstall_record_path_traversal() -> Result<()> {
+    // The traversal-depth count differs between Unix (`.venv/lib/pythonX.Y/site-packages`)
+    // and Windows (`.venv/Lib/site-packages`), so normalize the `../` sequence in the warning.
+    let context = uv_test::test_context!("3.12").with_filter((
+        r"(\.\./)+traversal_target\.txt",
+        "[..]/traversal_target.txt",
+    ));
+
+    context
+        .init()
+        .arg("--lib")
+        .arg("evilpkg")
+        .assert()
+        .success();
+    context.pip_install().arg("./evilpkg").assert().success();
+
+    // Build the relative traversal path from site-packages to a target file outside
+    // site-packages but inside the test temp dir. RECORD uses forward slashes, even on
+    // Windows, and the environment layout (and thus the traversal depth) differs by platform,
+    // so we construct the path manually and filter the leading `../` sequence out of the
+    // snapshot above.
+    let target_file = context.temp_dir.child("traversal_target.txt");
+    target_file.write_str("I should not be deleted")?;
+    // Canonicalize the temp dir, since `site_packages` is built from a canonicalized path
+    // (with `\\?\`), which would otherwise make `strip_prefix` fail.
+    let canonical_temp_dir = context.temp_dir.canonicalize()?;
+    let depth = context
+        .site_packages()
+        .strip_prefix(&canonical_temp_dir)?
+        .components()
+        .count();
+    let traversal_record = format!("{}traversal_target.txt", "../".repeat(depth));
+
+    let record_file = context
+        .site_packages()
+        .join("evilpkg-0.1.0.dist-info/RECORD");
+    let record = fs_err::read_to_string(&record_file)?;
+    let record = format!("{}\n{},,0\n", record.trim(), traversal_record);
+    fs_err::write(record_file, &record)?;
+
+    let init_py = context.site_packages().join("evilpkg/__init__.py");
+    assert!(context.site_packages().join(&traversal_record).exists());
+    assert!(init_py.exists());
+
+    uv_snapshot!(context.filters(), context.pip_uninstall()
+        .arg("evilpkg"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    warning: Invalid RECORD entry in evilpkg==0.1.0 (from file://[TEMP_DIR]/evilpkg) that escapes the Python environment, skipping: [..]/traversal_target.txt
+    Uninstalled 1 package in [TIME]
+     - evilpkg==0.1.0 (from file://[TEMP_DIR]/evilpkg)
+    ");
+
+    // The regular package files have been removed, while the file outside the scheme still exists.
+    assert!(target_file.exists());
+    assert!(!init_py.exists());
+
+    Ok(())
+}
+
+/// Egg `top_level.txt` entries must be top-level names, not paths.
+#[test]
+fn uninstall_egg_info_top_level_path_traversal() -> Result<()> {
+    // The traversal-depth count differs between Unix (`.venv/lib/pythonX.Y/site-packages`)
+    // and Windows (`.venv/Lib/site-packages`), so normalize the `../` sequence in the warning.
+    let context = uv_test::test_context!("3.12")
+        .with_filter((r"(\.\./)+traversal_target", "[..]/traversal_target"));
+
+    let site_packages = ChildPath::new(context.site_packages());
+
+    // Manually create a `name-version.egg-info` directory, which is recognized by the shared egg
+    // filename parser.
+    let egg_info = site_packages.child("evilpkg-0.1.0.egg-info");
+    egg_info.create_dir_all()?;
+
+    // The traversal target is outside site-packages but inside the environment, so a wheel RECORD entry
+    // could validly target this scheme area. An egg `top_level.txt` entry must not.
+    let target_dir = context.venv.child("traversal_target");
+    let target_file = target_dir.child("secret.txt");
+    target_file.write_str("I should not be deleted")?;
+
+    let depth = context
+        .site_packages()
+        .strip_prefix(context.venv.path())?
+        .components()
+        .count();
+    let traversal_entry = format!("{}traversal_target", "../".repeat(depth));
+    assert!(context.site_packages().join(&traversal_entry).exists());
+
+    egg_info
+        .child("top_level.txt")
+        .write_str(&format!("evilpkg\n{traversal_entry}\n"))?;
+
+    let init_py = site_packages.child("evilpkg").child("__init__.py");
+    init_py.touch()?;
+
+    uv_snapshot!(context.filters(), context.pip_uninstall()
+        .arg("evilpkg"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    warning: Invalid `top_level.txt` entry in evilpkg==0.1.0 that is not a top-level module or package, skipping: [..]/traversal_target
+    Uninstalled 1 package in [TIME]
+     - evilpkg==0.1.0
+    ");
+
+    assert!(target_dir.exists());
+    assert!(target_file.exists());
+    assert!(!init_py.exists());
+    assert!(!egg_info.exists());
+
+    Ok(())
+}
+
+/// `--yes` is accepted for `pip uninstall` compatibility, but emits a warning.
+#[test]
+fn yes_flag() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.pip_uninstall()
+        .arg("--yes")
+        .arg("flask"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    warning: `--yes` has no effect (uv never asks for confirmation)
+    warning: Skipping flask as it is not installed
+    warning: No packages to uninstall
+    "
+    );
+}
+
+/// `-y` is accepted for `pip uninstall` compatibility, but emits a warning.
+#[test]
+fn yes_short_flag() {
+    let context = uv_test::test_context!("3.12");
+
+    uv_snapshot!(context.filters(), context.pip_uninstall()
+        .arg("-y")
+        .arg("flask"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    warning: `--yes` has no effect (uv never asks for confirmation)
+    warning: Skipping flask as it is not installed
+    warning: No packages to uninstall
+    "
+    );
 }

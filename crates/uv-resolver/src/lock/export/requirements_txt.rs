@@ -12,7 +12,7 @@ use uv_distribution_filename::{DistExtension, SourceDistExtension};
 use uv_fs::Simplified;
 use uv_git_types::GitReference;
 use uv_normalize::PackageName;
-use uv_pypi_types::{ParsedArchiveUrl, ParsedGitUrl};
+use uv_pypi_types::{ParsedArchiveUrl, ParsedGitDirectoryUrl, ParsedGitPathUrl};
 use uv_redacted::DisplaySafeUrl;
 
 use crate::lock::export::{ExportableRequirement, ExportableRequirements};
@@ -24,7 +24,7 @@ use crate::{Installable, LockError};
 pub struct RequirementsTxtExport<'lock> {
     nodes: Vec<ExportableRequirement<'lock>>,
     hashes: bool,
-    editable: EditableMode,
+    editable: Option<EditableMode>,
 }
 
 impl<'lock> RequirementsTxtExport<'lock> {
@@ -34,7 +34,7 @@ impl<'lock> RequirementsTxtExport<'lock> {
         extras: &ExtrasSpecificationWithDefaults,
         dev: &DependencyGroupsWithDefaults,
         annotate: bool,
-        editable: EditableMode,
+        editable: Option<EditableMode>,
         hashes: bool,
         install_options: &'lock InstallOptions,
     ) -> Result<Self, LockError> {
@@ -46,7 +46,7 @@ impl<'lock> RequirementsTxtExport<'lock> {
             dev,
             annotate,
             install_options,
-        );
+        )?;
 
         // Sort the nodes, such that unnamed URLs (editables) appear at the top.
         nodes.sort_unstable_by(|a, b| {
@@ -91,14 +91,25 @@ impl std::fmt::Display for RequirementsTxtExport<'_> {
                         url,
                         GitReference::from(git.kind.clone()),
                         git.precise,
+                        git.lfs,
                     )
                     .expect("Internal Git URLs must have supported schemes");
 
                     // Reconstruct the PEP 508-compatible URL from the `GitSource`.
-                    let url = DisplaySafeUrl::from(ParsedGitUrl {
-                        url: git_url.clone(),
-                        subdirectory: git.subdirectory.clone(),
-                    });
+                    let url = if let Some(install_path) = git.path.as_ref() {
+                        let ext =
+                            DistExtension::from_path(install_path).map_err(|_| std::fmt::Error)?;
+                        DisplaySafeUrl::from(ParsedGitPathUrl {
+                            url: git_url.clone(),
+                            install_path: install_path.clone(),
+                            ext,
+                        })
+                    } else {
+                        DisplaySafeUrl::from(ParsedGitDirectoryUrl {
+                            url: git_url.clone(),
+                            subdirectory: git.subdirectory.clone(),
+                        })
+                    };
 
                     write!(f, "{} @ {}", package.id.name, url)?;
                 }
@@ -129,10 +140,10 @@ impl std::fmt::Display for RequirementsTxtExport<'_> {
                     }
                 }
                 Source::Editable(path) => match self.editable {
-                    EditableMode::Editable => {
+                    None | Some(EditableMode::Editable) => {
                         write!(f, "-e {}", anchor(path).portable_display())?;
                     }
-                    EditableMode::NonEditable => {
+                    Some(EditableMode::NonEditable) => {
                         if path.is_absolute() {
                             write!(
                                 f,

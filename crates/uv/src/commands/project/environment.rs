@@ -8,14 +8,21 @@ use crate::commands::project::{
     EnvironmentSpecification, PlatformState, ProjectError, resolve_environment, sync_environment,
 };
 use crate::printer::Printer;
-use crate::settings::{NetworkSettings, ResolverInstallerSettings};
+use crate::settings::ResolverInstallerSettings;
 
 use uv_cache::{Cache, CacheBucket};
+use uv_cache_info::CacheInfo;
 use uv_cache_key::{cache_digest, hash_digest};
-use uv_configuration::{Concurrency, Constraints, Preview};
-use uv_distribution_types::{Name, Resolution};
+use uv_client::BaseClientBuilder;
+use uv_configuration::{Concurrency, Constraints, TargetTriple};
+use uv_distribution_types::{
+    BuiltDist, Dist, Identifier, Node, Resolution, ResolvedDist, SourceDist,
+};
 use uv_fs::PythonExt;
+use uv_preview::Preview;
 use uv_python::{Interpreter, PythonEnvironment, canonicalize_executable};
+use uv_types::SourceTreeEditablePolicy;
+use uv_workspace::WorkspaceCache;
 
 /// An ephemeral [`PythonEnvironment`] for running an individual command.
 #[derive(Debug)]
@@ -35,7 +42,6 @@ impl From<EphemeralEnvironment> for PythonEnvironment {
 
 impl EphemeralEnvironment {
     /// Set the ephemeral overlay for a Python environment.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn set_overlay(&self, contents: impl AsRef<[u8]>) -> Result<(), ProjectError> {
         let site_packages = self
             .0
@@ -48,7 +54,6 @@ impl EphemeralEnvironment {
     }
 
     /// Enable system site packages for a Python environment.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn set_system_site_packages(&self) -> Result<(), ProjectError> {
         self.0
             .set_pyvenv_cfg("include-system-site-packages", "true")?;
@@ -67,7 +72,6 @@ impl EphemeralEnvironment {
     /// `extends-environment` key of the ephemeral environment's `pyvenv.cfg` file, making it
     /// easier for these tools to statically and reliably understand the relationship between
     /// the two environments.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn set_parent_environment(
         &self,
         parent_environment_sys_prefix: &Path,
@@ -104,20 +108,29 @@ impl From<CachedEnvironment> for PythonEnvironment {
     }
 }
 
+#[derive(Debug, Clone, Hash)]
+struct CachedEnvironmentDist {
+    dist: ResolvedDist,
+    hashes: uv_pypi_types::HashDigests,
+    cache_info: Option<CacheInfo>,
+}
+
 impl CachedEnvironment {
     /// Get or create an [`CachedEnvironment`] based on a given set of requirements.
     pub(crate) async fn from_spec(
         spec: EnvironmentSpecification<'_>,
         build_constraints: Constraints,
         interpreter: &Interpreter,
+        python_platform: Option<&TargetTriple>,
         settings: &ResolverInstallerSettings,
-        network_settings: &NetworkSettings,
+        client_builder: &BaseClientBuilder<'_>,
         state: &PlatformState,
         resolve: Box<dyn ResolveLogger>,
         install: Box<dyn InstallLogger>,
         installer_metadata: bool,
-        concurrency: Concurrency,
+        concurrency: &Concurrency,
         cache: &Cache,
+        workspace_cache: &WorkspaceCache,
         printer: Printer,
         preview: Preview,
     ) -> Result<Self, ProjectError> {
@@ -128,13 +141,16 @@ impl CachedEnvironment {
             resolve_environment(
                 spec,
                 &interpreter,
+                python_platform,
+                SourceTreeEditablePolicy::Project,
                 build_constraints.clone(),
                 &settings.resolver,
-                network_settings,
+                client_builder,
                 state,
                 resolve,
                 concurrency,
                 cache,
+                workspace_cache,
                 printer,
                 preview,
             )
@@ -142,11 +158,31 @@ impl CachedEnvironment {
         );
 
         // Hash the resolution by hashing the generated lockfile.
-        // TODO(charlie): If the resolution contains any mutable metadata (like a path or URL
-        // dependency), skip this step.
         let resolution_hash = {
-            let mut distributions = resolution.distributions().collect::<Vec<_>>();
-            distributions.sort_unstable_by_key(|dist| dist.name());
+            let mut distributions = resolution
+                .graph()
+                .node_weights()
+                .filter_map(|node| match node {
+                    Node::Dist {
+                        dist,
+                        hashes,
+                        install: true,
+                    } => Some((dist, hashes)),
+                    Node::Dist { install: false, .. } | Node::Root => None,
+                })
+                .map(|(dist, hashes)| {
+                    Ok(CachedEnvironmentDist {
+                        dist: dist.clone(),
+                        hashes: hashes.clone(),
+                        cache_info: Self::cache_info(dist).map_err(ProjectError::from)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProjectError>>()?;
+            distributions.sort_unstable_by(|left, right| {
+                left.dist
+                    .distribution_id()
+                    .cmp(&right.dist.distribution_id())
+            });
             hash_digest(&distributions)
         };
 
@@ -170,11 +206,9 @@ impl CachedEnvironment {
         // Search in the content-addressed cache.
         let cache_entry = cache.entry(CacheBucket::Environments, interpreter_hash, resolution_hash);
 
-        if cache.refresh().is_none() {
-            if let Ok(root) = cache.resolve_link(cache_entry.path()) {
-                if let Ok(environment) = PythonEnvironment::from_root(root, cache) {
-                    return Ok(Self(environment));
-                }
+        if let Ok(root) = cache.resolve_link(cache_entry.path()) {
+            if let Ok(environment) = PythonEnvironment::from_root(root, cache) {
+                return Ok(Self(environment));
             }
         }
 
@@ -185,11 +219,10 @@ impl CachedEnvironment {
             interpreter,
             uv_virtualenv::Prompt::None,
             false,
-            uv_virtualenv::OnExisting::Remove,
+            uv_virtualenv::OnExisting::Remove(uv_virtualenv::RemovalReason::TemporaryEnvironment),
             true,
             false,
             false,
-            preview,
         )?;
 
         sync_environment(
@@ -198,7 +231,7 @@ impl CachedEnvironment {
             Modifications::Exact,
             build_constraints,
             settings.into(),
-            network_settings,
+            client_builder,
             state,
             install,
             installer_metadata,
@@ -214,6 +247,22 @@ impl CachedEnvironment {
         let root = cache.archive(&id);
 
         Ok(Self(PythonEnvironment::from_root(root, cache)?))
+    }
+
+    /// Return any mutable cache info that should invalidate a cached environment for a given
+    /// distribution.
+    fn cache_info(dist: &ResolvedDist) -> Result<Option<CacheInfo>, uv_cache_info::CacheInfoError> {
+        let path = match dist {
+            ResolvedDist::Installed { .. } => return Ok(None),
+            ResolvedDist::Installable { dist, .. } => match dist.as_ref() {
+                Dist::Built(BuiltDist::Path(wheel)) => wheel.install_path.as_ref(),
+                Dist::Source(SourceDist::Path(sdist)) => sdist.install_path.as_ref(),
+                Dist::Source(SourceDist::Directory(directory)) => directory.install_path.as_ref(),
+                _ => return Ok(None),
+            },
+        };
+
+        Ok(Some(CacheInfo::from_path(path)?))
     }
 
     /// Return the [`Interpreter`] to use for the cached environment, based on a given

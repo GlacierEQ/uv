@@ -12,8 +12,8 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use uv_configuration::{Constraints, Overrides};
 use uv_distribution::Metadata;
 use uv_distribution_types::{
-    Dist, DistributionMetadata, Edge, IndexUrl, Name, Node, Requirement, RequiresPython,
-    ResolutionDiagnostic, ResolvedDist, VersionId, VersionOrUrlRef,
+    Dist, DistributionId, Edge, Identifier, IndexUrl, Name, Node, Requirement, RequiresPython,
+    ResolutionDiagnostic, ResolvedDist,
 };
 use uv_git::GitResolver;
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -59,7 +59,7 @@ pub struct ResolverOutput {
 }
 
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum ResolutionGraphNode {
     Root,
     Dist(AnnotatedDist),
@@ -87,7 +87,7 @@ impl ResolutionGraphNode {
         match self {
             Self::Root => None,
             Self::Dist(dist) => {
-                let group = dist.dev.as_ref()?;
+                let group = dist.group.as_ref()?;
                 Some((&dist.name, group))
             }
         }
@@ -294,7 +294,7 @@ impl ResolverOutput {
                 url: edge.from_url.as_ref(),
                 index: edge.from_index.as_ref(),
                 extra: edge.from_extra.as_ref(),
-                group: edge.from_dev.as_ref(),
+                group: edge.from_group.as_ref(),
             }]
         });
         let to_index = inverse[&PackageRef {
@@ -303,7 +303,7 @@ impl ResolverOutput {
             url: edge.to_url.as_ref(),
             index: edge.to_index.as_ref(),
             extra: edge.to_extra.as_ref(),
-            group: edge.to_dev.as_ref(),
+            group: edge.to_group.as_ref(),
         }];
 
         let edge_marker = {
@@ -338,7 +338,7 @@ impl ResolverOutput {
         let ResolutionPackage {
             name,
             extra,
-            dev,
+            dev: group,
             url,
             index,
         } = &package;
@@ -358,7 +358,7 @@ impl ResolverOutput {
         if let Some(metadata) = metadata.as_ref() {
             // Validate the extra.
             if let Some(extra) = extra {
-                if !metadata.provides_extras.contains(extra) {
+                if !metadata.provides_extra.contains(extra) {
                     diagnostics.push(ResolutionDiagnostic::MissingExtra {
                         dist: dist.clone(),
                         extra: extra.clone(),
@@ -367,11 +367,11 @@ impl ResolverOutput {
             }
 
             // Validate the development dependency group.
-            if let Some(dev) = dev {
+            if let Some(dev) = group {
                 if !metadata.dependency_groups.contains_key(dev) {
-                    diagnostics.push(ResolutionDiagnostic::MissingDev {
+                    diagnostics.push(ResolutionDiagnostic::MissingGroup {
                         dist: dist.clone(),
-                        dev: dev.clone(),
+                        group: dev.clone(),
                     });
                 }
             }
@@ -383,7 +383,7 @@ impl ResolverOutput {
             name: name.clone(),
             version: version.clone(),
             extra: extra.clone(),
-            dev: dev.clone(),
+            group: group.clone(),
             hashes,
             metadata,
             marker: UniversalMarker::TRUE,
@@ -395,7 +395,7 @@ impl ResolverOutput {
                 url: url.as_ref(),
                 index: index.as_ref(),
                 extra: extra.as_ref(),
-                group: dev.as_ref(),
+                group: group.as_ref(),
             },
             node,
         );
@@ -414,17 +414,17 @@ impl ResolverOutput {
         git: &GitResolver,
     ) -> Result<(ResolvedDist, HashDigests, Option<Metadata>), ResolveError> {
         Ok(if let Some(url) = url {
-            // Create the distribution.
+            // Create the locked distribution and recover the metadata using the original URL that
+            // was requested during resolution.
             let dist = Dist::from_url(name.clone(), url_to_precise(url.clone(), git))?;
-
-            let version_id = VersionId::from_url(&url.verbatim);
+            let metadata_id = Dist::from_url(name.clone(), url.clone())?.distribution_id();
 
             // Extract the hashes.
             let hashes = Self::get_hashes(
                 name,
                 index,
                 Some(url),
-                &version_id,
+                &metadata_id,
                 version,
                 preferences,
                 in_memory,
@@ -434,13 +434,13 @@ impl ResolverOutput {
             let metadata = {
                 let response = in_memory
                     .distributions()
-                    .get(&version_id)
+                    .get(&metadata_id)
                     .unwrap_or_else(|| {
-                        panic!("Every URL distribution should have metadata: {version_id:?}")
+                        panic!("Every URL distribution should have metadata: {metadata_id:?}")
                     });
 
                 let MetadataResponse::Found(archive) = &*response else {
-                    panic!("Every URL distribution should have metadata: {version_id:?}")
+                    panic!("Every URL distribution should have metadata: {metadata_id:?}")
                 };
 
                 archive.metadata.clone()
@@ -455,12 +455,11 @@ impl ResolverOutput {
                 Some(metadata),
             )
         } else {
-            let dist = pins
-                .get(name, version)
-                .expect("Every package should be pinned")
-                .clone();
-
-            let version_id = dist.version_id();
+            let (dist, metadata_id) = pins
+                .dist_and_id(name, version)
+                .expect("Every package should be pinned");
+            let dist = dist.clone();
+            let hashes_id = dist.distribution_id();
 
             // Track yanks for any registry distributions.
             match dist.yanked() {
@@ -484,7 +483,7 @@ impl ResolverOutput {
                 name,
                 index,
                 None,
-                &version_id,
+                &hashes_id,
                 version,
                 preferences,
                 in_memory,
@@ -494,7 +493,7 @@ impl ResolverOutput {
             let metadata = {
                 in_memory
                     .distributions()
-                    .get(&version_id)
+                    .get(metadata_id)
                     .and_then(|response| {
                         if let MetadataResponse::Found(archive) = &*response {
                             Some(archive.metadata.clone())
@@ -508,13 +507,13 @@ impl ResolverOutput {
         })
     }
 
-    /// Identify the hashes for the [`VersionId`], preserving any hashes that were provided by the
-    /// lockfile.
+    /// Identify the hashes for a concrete distribution, preserving any hashes that were provided
+    /// by the lockfile.
     fn get_hashes(
         name: &PackageName,
         index: Option<&IndexUrl>,
         url: Option<&VerbatimParsedUrl>,
-        version_id: &VersionId,
+        metadata_id: &DistributionId,
         version: &Version,
         preferences: &Preferences,
         in_memory: &InMemoryIndex,
@@ -527,7 +526,7 @@ impl ResolverOutput {
         }
 
         // 2. Look for hashes for the distribution (i.e., the specific wheel or source distribution).
-        if let Some(metadata_response) = in_memory.distributions().get(version_id) {
+        if let Some(metadata_response) = in_memory.distributions().get(metadata_id) {
             if let MetadataResponse::Found(ref archive) = *metadata_response {
                 let mut digests = archive.hashes.clone();
                 digests.sort_unstable();
@@ -711,21 +710,13 @@ impl ResolverOutput {
             let ResolutionGraphNode::Dist(dist) = &self.graph[i] else {
                 continue;
             };
-            let version_id = match dist.version_or_url() {
-                VersionOrUrlRef::Version(version) => {
-                    VersionId::from_registry(dist.name().clone(), version.clone())
-                }
-                VersionOrUrlRef::Url(verbatim_url) => VersionId::from_url(verbatim_url.raw()),
-            };
+            let metadata_id = dist.dist.distribution_id();
             let res = index
                 .distributions()
-                .get(&version_id)
+                .get(&metadata_id)
                 .expect("every package in resolution graph has metadata");
             let MetadataResponse::Found(archive, ..) = &*res else {
-                panic!(
-                    "Every package should have metadata: {:?}",
-                    dist.version_id()
-                )
+                panic!("Every package should have metadata: {metadata_id:?}")
             };
             for req in self
                 .constraints
@@ -914,8 +905,8 @@ impl From<ResolverOutput> for uv_distribution_types::Resolution {
 
                     let edge = if let Some(extra) = source_dist.extra.as_ref() {
                         Edge::Optional(extra.clone())
-                    } else if let Some(dev) = source_dist.dev.as_ref() {
-                        Edge::Dev(dev.clone())
+                    } else if let Some(group) = source_dist.group.as_ref() {
+                        Edge::Dev(group.clone())
                     } else {
                         Edge::Prod
                     };

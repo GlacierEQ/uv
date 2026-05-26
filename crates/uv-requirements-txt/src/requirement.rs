@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::path::Path;
 
 use uv_normalize::PackageName;
@@ -81,7 +82,10 @@ impl RequirementsTxtRequirement {
                     ParsedUrl::Archive(_) => {
                         return Err(EditableError::Https(requirement.name, url.to_string()));
                     }
-                    ParsedUrl::Git(_) => {
+                    ParsedUrl::GitDirectory(_) => {
+                        return Err(EditableError::Git(requirement.name, url.to_string()));
+                    }
+                    ParsedUrl::GitPath(_) => {
                         return Err(EditableError::Git(requirement.name, url.to_string()));
                     }
                 };
@@ -106,7 +110,10 @@ impl RequirementsTxtRequirement {
                     ParsedUrl::Archive(_) => {
                         return Err(EditableError::UnnamedHttps(requirement.to_string()));
                     }
-                    ParsedUrl::Git(_) => {
+                    ParsedUrl::GitDirectory(_) => {
+                        return Err(EditableError::UnnamedGit(requirement.to_string()));
+                    }
+                    ParsedUrl::GitPath(_) => {
                         return Err(EditableError::UnnamedGit(requirement.to_string()));
                     }
                 };
@@ -124,9 +131,7 @@ impl RequirementsTxtRequirement {
             }
         }
     }
-}
 
-impl RequirementsTxtRequirement {
     /// Parse a requirement as seen in a `requirements.txt` file.
     pub fn parse(
         input: &str,
@@ -160,5 +165,14 @@ impl RequirementsTxtRequirement {
             },
         }
         .map_err(Box::new)
+    }
+}
+
+impl Display for RequirementsTxtRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named(requirement) => Display::fmt(&requirement, f),
+            Self::Unnamed(requirement) => Display::fmt(&requirement, f),
+        }
     }
 }

@@ -42,8 +42,7 @@ pub use crate::origin::RequirementOrigin;
 #[cfg(feature = "non-pep508-extensions")]
 pub use crate::unnamed::{UnnamedRequirement, UnnamedRequirementUrl};
 pub use crate::verbatim_url::{
-    Scheme, VerbatimUrl, VerbatimUrlError, expand_env_vars, looks_like_git_repository,
-    split_scheme, strip_host,
+    Scheme, VerbatimUrl, VerbatimUrlError, expand_env_vars, looks_like_git_repository, split_scheme,
 };
 /// Version and version specifiers used in requirements (reexport).
 // https://github.com/konstin/pep508_rs/issues/19
@@ -78,7 +77,7 @@ pub enum Pep508ErrorSource<T: Pep508Url = VerbatimUrl> {
     String(String),
     /// A URL parsing error.
     #[error(transparent)]
-    UrlError(T::Err),
+    UrlError(Box<T::Err>),
     /// The version requirement is not supported.
     #[error("{0}")]
     UnsupportedRequirement(String),
@@ -151,69 +150,56 @@ impl<T: Pep508Url> Requirement<T> {
 
     /// Returns a [`Display`] implementation that doesn't mask credentials.
     pub fn displayable_with_credentials(&self) -> impl Display {
-        RequirementDisplay {
-            requirement: self,
-            display_credentials: true,
-        }
+        std::fmt::from_fn(|f| fmt_requirement(self, f, true))
     }
 }
 
 impl<T: Pep508Url + Display> Display for Requirement<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        RequirementDisplay {
-            requirement: self,
-            display_credentials: false,
-        }
-        .fmt(f)
+        fmt_requirement(self, f, false)
     }
 }
 
-struct RequirementDisplay<'a, T>
-where
-    T: Pep508Url + Display,
-{
-    requirement: &'a Requirement<T>,
+fn fmt_requirement<T: Pep508Url + Display>(
+    requirement: &Requirement<T>,
+    f: &mut Formatter<'_>,
     display_credentials: bool,
-}
-
-impl<T: Pep508Url + Display> Display for RequirementDisplay<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.requirement.name)?;
-        if !self.requirement.extras.is_empty() {
-            write!(
-                f,
-                "[{}]",
-                self.requirement
-                    .extras
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )?;
-        }
-        if let Some(version_or_url) = &self.requirement.version_or_url {
-            match version_or_url {
-                VersionOrUrl::VersionSpecifier(version_specifier) => {
-                    let version_specifier: Vec<String> =
-                        version_specifier.iter().map(ToString::to_string).collect();
-                    write!(f, "{}", version_specifier.join(","))?;
-                }
-                VersionOrUrl::Url(url) => {
-                    let url_string = if self.display_credentials {
-                        url.displayable_with_credentials().to_string()
-                    } else {
-                        url.to_string()
-                    };
-                    // We add the space for markers later if necessary
-                    write!(f, " @ {url_string}")?;
-                }
+) -> std::fmt::Result {
+    write!(f, "{}", requirement.name)?;
+    if !requirement.extras.is_empty() {
+        write!(
+            f,
+            "[{}]",
+            requirement
+                .extras
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
+    }
+    if let Some(version_or_url) = &requirement.version_or_url {
+        match version_or_url {
+            VersionOrUrl::VersionSpecifier(version_specifier) => {
+                let version_specifier: Vec<String> =
+                    version_specifier.iter().map(ToString::to_string).collect();
+                write!(f, "{}", version_specifier.join(","))?;
+            }
+            VersionOrUrl::Url(url) => {
+                let url_string = if display_credentials {
+                    url.displayable_with_credentials().to_string()
+                } else {
+                    url.to_string()
+                };
+                // We add the space for markers later if necessary
+                write!(f, " @ {url_string}")?;
             }
         }
-        if let Some(marker) = self.requirement.marker.contents() {
-            write!(f, " ; {marker}")?;
-        }
-        Ok(())
     }
+    if let Some(marker) = requirement.marker.contents() {
+        write!(f, " ; {marker}")?;
+    }
+    Ok(())
 }
 
 /// <https://github.com/serde-rs/serde/issues/908#issuecomment-298027413>
@@ -409,20 +395,6 @@ impl<T: Pep508Url> Requirement<T> {
             &mut Cursor::new(input),
             Some(working_dir.as_ref()),
             &mut TracingReporter,
-        )
-    }
-
-    /// Parse a [Dependency Specifier](https://packaging.python.org/en/latest/specifications/dependency-specifiers/)
-    /// with the given reporter for warnings.
-    pub fn parse_reporter(
-        input: &str,
-        working_dir: impl AsRef<Path>,
-        reporter: &mut impl Reporter,
-    ) -> Result<Self, Pep508Error<T>> {
-        parse_pep508_requirement(
-            &mut Cursor::new(input),
-            Some(working_dir.as_ref()),
-            reporter,
         )
     }
 }
@@ -792,7 +764,7 @@ fn parse_url<T: Pep508Url>(
     }
 
     let url = T::parse_url(url, working_dir).map_err(|err| Pep508Error {
-        message: Pep508ErrorSource::UrlError(err),
+        message: Pep508ErrorSource::UrlError(Box::new(err)),
         start,
         len,
         input: cursor.to_string(),
@@ -807,7 +779,7 @@ fn parse_url<T: Pep508Url>(
 /// - If the string ends with a closing bracket (`]`)...
 /// - Iterate backwards until you find the open bracket (`[`)...
 /// - But abort if you find another closing bracket (`]`) first.
-pub fn split_extras(given: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_extras(given: &str) -> Option<(&str, &str)> {
     let mut chars = given.char_indices().rev();
 
     // If the string ends with a closing bracket (`]`)...
@@ -1045,11 +1017,45 @@ fn parse_pep508_requirement<T: Pep508Url>(
     })
 }
 
+#[cfg(feature = "rkyv")]
+/// An [`rkyv`] implementation for [`Requirement`].
+impl<T: Pep508Url + Display> rkyv::Archive for Requirement<T> {
+    type Archived = rkyv::string::ArchivedString;
+    type Resolver = rkyv::string::StringResolver;
+
+    #[inline]
+    fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        let as_str = self.to_string();
+        rkyv::string::ArchivedString::resolve_from_str(&as_str, resolver, out);
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl<T: Pep508Url + Display, S> rkyv::Serialize<S> for Requirement<T>
+where
+    S: rkyv::rancor::Fallible + rkyv::ser::Allocator + rkyv::ser::Writer + ?Sized,
+    S::Error: rkyv::rancor::Source,
+{
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        let as_str = self.to_string();
+        rkyv::string::ArchivedString::serialize_from_str(&as_str, serializer)
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl<T: Pep508Url + Display, D: rkyv::rancor::Fallible + ?Sized>
+    rkyv::Deserialize<Requirement<T>, D> for rkyv::string::ArchivedString
+{
+    fn deserialize(&self, _deserializer: &mut D) -> Result<Requirement<T>, D::Error> {
+        // SAFETY: We only serialize valid requirements.
+        Ok(Requirement::<T>::from_str(self.as_str()).unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Half of these tests are copied from <https://github.com/pypa/packaging/pull/624>
 
-    use std::env;
     use std::str::FromStr;
 
     use insta::assert_snapshot;
@@ -1096,10 +1102,11 @@ mod tests {
     fn error_empty() {
         assert_snapshot!(
             parse_pep508_err(""),
-            @r"
-    Empty field is not allowed for PEP508
+            @"
+        Empty field is not allowed for PEP508
 
-    ^"
+        ^
+        "
         );
     }
 
@@ -1110,7 +1117,8 @@ mod tests {
             @"
         Expected package name starting with an alphanumeric character, found `_`
         _name
-        ^"
+        ^
+        "
         );
     }
 
@@ -1121,7 +1129,8 @@ mod tests {
             @"
         Package name must end with an alphanumeric character, not `_`
         name_
-            ^"
+            ^
+        "
         );
     }
 
@@ -1238,11 +1247,11 @@ mod tests {
     fn error_extras_eof1() {
         assert_snapshot!(
             parse_pep508_err("black["),
-            @r#"
-    Missing closing bracket (expected ']', found end of dependency specification)
-    black[
-         ^
-    "#
+            @"
+        Missing closing bracket (expected ']', found end of dependency specification)
+        black[
+             ^
+        "
         );
     }
 
@@ -1250,11 +1259,11 @@ mod tests {
     fn error_extras_eof2() {
         assert_snapshot!(
             parse_pep508_err("black[d"),
-            @r#"
-    Missing closing bracket (expected ']', found end of dependency specification)
-    black[d
-         ^
-    "#
+            @"
+        Missing closing bracket (expected ']', found end of dependency specification)
+        black[d
+             ^
+        "
         );
     }
 
@@ -1262,11 +1271,11 @@ mod tests {
     fn error_extras_eof3() {
         assert_snapshot!(
             parse_pep508_err("black[d,"),
-            @r#"
-    Missing closing bracket (expected ']', found end of dependency specification)
-    black[d,
-         ^
-    "#
+            @"
+        Missing closing bracket (expected ']', found end of dependency specification)
+        black[d,
+             ^
+        "
         );
     }
 
@@ -1274,11 +1283,11 @@ mod tests {
     fn error_extras_illegal_start1() {
         assert_snapshot!(
             parse_pep508_err("black[ö]"),
-            @r#"
-    Expected an alphanumeric character starting the extra name, found `ö`
-    black[ö]
-          ^
-    "#
+            @"
+        Expected an alphanumeric character starting the extra name, found `ö`
+        black[ö]
+              ^
+        "
         );
     }
 
@@ -1286,11 +1295,11 @@ mod tests {
     fn error_extras_illegal_start2() {
         assert_snapshot!(
             parse_pep508_err("black[_d]"),
-            @r#"
-    Expected an alphanumeric character starting the extra name, found `_`
-    black[_d]
-          ^
-    "#
+            @"
+        Expected an alphanumeric character starting the extra name, found `_`
+        black[_d]
+              ^
+        "
         );
     }
 
@@ -1298,11 +1307,11 @@ mod tests {
     fn error_extras_illegal_start3() {
         assert_snapshot!(
             parse_pep508_err("black[,]"),
-            @r#"
-    Expected either alphanumerical character (starting the extra name) or `]` (ending the extras section), found `,`
-    black[,]
-          ^
-    "#
+            @"
+        Expected either alphanumerical character (starting the extra name) or `]` (ending the extras section), found `,`
+        black[,]
+              ^
+        "
         );
     }
 
@@ -1310,11 +1319,11 @@ mod tests {
     fn error_extras_illegal_character() {
         assert_snapshot!(
             parse_pep508_err("black[jüpyter]"),
-            @r#"
-    Invalid character in extras name, expected an alphanumeric character, `-`, `_`, `.`, `,` or `]`, found `ü`
-    black[jüpyter]
-           ^
-    "#
+            @"
+        Invalid character in extras name, expected an alphanumeric character, `-`, `_`, `.`, `,` or `]`, found `ü`
+        black[jüpyter]
+               ^
+        "
         );
     }
 
@@ -1355,7 +1364,8 @@ mod tests {
             @"
         Expected an alphanumeric character starting the extra name, found `]`
         black[d,]
-                ^"
+                ^
+        "
         );
     }
 
@@ -1363,10 +1373,11 @@ mod tests {
     fn error_parenthesized_pep440() {
         assert_snapshot!(
             parse_pep508_err("numpy ( ><1.19 )"),
-            @"
-        no such comparison operator \"><\", must be one of ~= == != <= >= < > ===
+            @r#"
+        no such comparison operator "><", must be one of ~= == != <= >= < > ===
         numpy ( ><1.19 )
-                ^^^^^^^"
+                ^^^^^^^
+        "#
         );
     }
 
@@ -1374,11 +1385,11 @@ mod tests {
     fn error_parenthesized_parenthesis() {
         assert_snapshot!(
             parse_pep508_err("numpy ( >=1.19"),
-            @r#"
-    Missing closing parenthesis (expected ')', found end of dependency specification)
-    numpy ( >=1.19
-          ^
-    "#
+            @"
+        Missing closing parenthesis (expected ')', found end of dependency specification)
+        numpy ( >=1.19
+              ^
+        "
         );
     }
 
@@ -1386,11 +1397,11 @@ mod tests {
     fn error_whats_that() {
         assert_snapshot!(
             parse_pep508_err("numpy % 1.16"),
-            @r#"
-    Expected one of `@`, `(`, `<`, `=`, `>`, `~`, `!`, `;`, found `%`
-    numpy % 1.16
-          ^
-    "#
+            @"
+        Expected one of `@`, `(`, `<`, `=`, `>`, `~`, `!`, `;`, found `%`
+        numpy % 1.16
+              ^
+        "
         );
     }
 
@@ -1457,11 +1468,11 @@ mod tests {
     fn error_marker_incomplete1() {
         assert_snapshot!(
             parse_pep508_err(r"numpy; sys_platform"),
-            @r#"
-    Expected a valid marker operator (such as `>=` or `not in`), found ``
-    numpy; sys_platform
-                       ^
-    "#
+            @"
+        Expected a valid marker operator (such as `>=` or `not in`), found ``
+        numpy; sys_platform
+                           ^
+        "
         );
     }
 
@@ -1469,11 +1480,11 @@ mod tests {
     fn error_marker_incomplete2() {
         assert_snapshot!(
             parse_pep508_err(r"numpy; sys_platform =="),
-            @r#"
-    Expected marker value, found end of dependency specification
-    numpy; sys_platform ==
-                          ^
-    "#
+            @"
+        Expected marker value, found end of dependency specification
+        numpy; sys_platform ==
+                              ^
+        "
         );
     }
 
@@ -1482,10 +1493,10 @@ mod tests {
         assert_snapshot!(
             parse_pep508_err(r#"numpy; sys_platform == "win32" or"#),
             @r#"
-    Expected marker value, found end of dependency specification
-    numpy; sys_platform == "win32" or
-                                     ^
-    "#
+        Expected marker value, found end of dependency specification
+        numpy; sys_platform == "win32" or
+                                         ^
+        "#
         );
     }
 
@@ -1494,10 +1505,10 @@ mod tests {
         assert_snapshot!(
             parse_pep508_err(r#"numpy; sys_platform == "win32" or (os_name == "linux""#),
             @r#"
-    Expected ')', found end of dependency specification
-    numpy; sys_platform == "win32" or (os_name == "linux"
-                                      ^
-    "#
+        Expected ')', found end of dependency specification
+        numpy; sys_platform == "win32" or (os_name == "linux"
+                                          ^
+        "#
         );
     }
 
@@ -1506,10 +1517,10 @@ mod tests {
         assert_snapshot!(
             parse_pep508_err(r#"numpy; sys_platform == "win32" or (os_name == "linux" and"#),
             @r#"
-    Expected marker value, found end of dependency specification
-    numpy; sys_platform == "win32" or (os_name == "linux" and
-                                                             ^
-    "#
+        Expected marker value, found end of dependency specification
+        numpy; sys_platform == "win32" or (os_name == "linux" and
+                                                                 ^
+        "#
         );
     }
 
@@ -1517,11 +1528,11 @@ mod tests {
     fn error_pep440() {
         assert_snapshot!(
             parse_pep508_err(r"numpy >=1.1.*"),
-            @r#"
-    Operator >= cannot be used with a wildcard version specifier
-    numpy >=1.1.*
-          ^^^^^^^
-    "#
+            @"
+        Operator >= cannot be used with a wildcard version specifier
+        numpy >=1.1.*
+              ^^^^^^^
+        "
         );
     }
 
@@ -1529,11 +1540,11 @@ mod tests {
     fn error_no_name() {
         assert_snapshot!(
             parse_pep508_err(r"==0.0"),
-            @r"
-    Expected package name starting with an alphanumeric character, found `=`
-    ==0.0
-    ^
-    "
+            @"
+        Expected package name starting with an alphanumeric character, found `=`
+        ==0.0
+        ^
+        "
         );
     }
 
@@ -1544,7 +1555,8 @@ mod tests {
             @"
         URL requirement must be preceded by a package name. Add the name of the package before the URL (e.g., `package_name @ https://...`).
         git+https://github.com/pallets/flask.git
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        "
         );
     }
 
@@ -1552,11 +1564,11 @@ mod tests {
     fn error_unnamed_file_path() {
         assert_snapshot!(
             parse_pep508_err(r"/path/to/flask.tar.gz"),
-            @r###"
-    URL requirement must be preceded by a package name. Add the name of the package before the URL (e.g., `package_name @ /path/to/file`).
-    /path/to/flask.tar.gz
-    ^^^^^^^^^^^^^^^^^^^^^
-    "###
+            @"
+        URL requirement must be preceded by a package name. Add the name of the package before the URL (e.g., `package_name @ /path/to/file`).
+        /path/to/flask.tar.gz
+        ^^^^^^^^^^^^^^^^^^^^^
+        "
         );
     }
 
@@ -1564,11 +1576,11 @@ mod tests {
     fn error_no_comma_between_extras() {
         assert_snapshot!(
             parse_pep508_err(r"name[bar baz]"),
-            @r#"
-    Expected either `,` (separating extras) or `]` (ending the extras section), found `b`
-    name[bar baz]
-             ^
-    "#
+            @"
+        Expected either `,` (separating extras) or `]` (ending the extras section), found `b`
+        name[bar baz]
+                 ^
+        "
         );
     }
 
@@ -1576,11 +1588,11 @@ mod tests {
     fn error_extra_comma_after_extras() {
         assert_snapshot!(
             parse_pep508_err(r"name[bar, baz,]"),
-            @r#"
-    Expected an alphanumeric character starting the extra name, found `]`
-    name[bar, baz,]
-                  ^
-    "#
+            @"
+        Expected an alphanumeric character starting the extra name, found `]`
+        name[bar, baz,]
+                      ^
+        "
         );
     }
 
@@ -1588,11 +1600,11 @@ mod tests {
     fn error_extras_not_closed() {
         assert_snapshot!(
             parse_pep508_err(r"name[bar, baz >= 1.0"),
-            @r#"
-    Expected either `,` (separating extras) or `]` (ending the extras section), found `>`
-    name[bar, baz >= 1.0
-                  ^
-    "#
+            @"
+        Expected either `,` (separating extras) or `]` (ending the extras section), found `>`
+        name[bar, baz >= 1.0
+                      ^
+        "
         );
     }
 
@@ -1600,11 +1612,11 @@ mod tests {
     fn error_name_at_nothing() {
         assert_snapshot!(
             parse_pep508_err(r"name @"),
-            @r#"
-    Expected URL
-    name @
-          ^
-    "#
+            @"
+        Expected URL
+        name @
+              ^
+        "
         );
     }
 
@@ -1612,14 +1624,14 @@ mod tests {
     fn parse_name_with_star() {
         assert_snapshot!(
             parse_pep508_err("wheel-*.whl"),
-            @r"
+            @"
         Package name must end with an alphanumeric character, not `-`
         wheel-*.whl
              ^
         ");
         assert_snapshot!(
             parse_pep508_err("wheelѦ"),
-            @r"
+            @"
         Expected one of `@`, `(`, `<`, `=`, `>`, `~`, `!`, `;`, found `Ѧ`
         wheelѦ
              ^
@@ -1630,11 +1642,11 @@ mod tests {
     fn test_error_invalid_marker_key() {
         assert_snapshot!(
             parse_pep508_err(r"name; invalid_name"),
-            @r#"
-    Expected a quoted string or a valid marker name, found `invalid_name`
-    name; invalid_name
-          ^^^^^^^^^^^^
-    "#
+            @"
+        Expected a quoted string or a valid marker name, found `invalid_name`
+        name; invalid_name
+              ^^^^^^^^^^^^
+        "
         );
     }
 
@@ -1642,11 +1654,11 @@ mod tests {
     fn error_markers_invalid_order() {
         assert_snapshot!(
             parse_pep508_err("name; '3.7' <= invalid_name"),
-            @r#"
-    Expected a quoted string or a valid marker name, found `invalid_name`
-    name; '3.7' <= invalid_name
-                   ^^^^^^^^^^^^
-    "#
+            @"
+        Expected a quoted string or a valid marker name, found `invalid_name`
+        name; '3.7' <= invalid_name
+                       ^^^^^^^^^^^^
+        "
         );
     }
 
@@ -1657,7 +1669,8 @@ mod tests {
             @"
         Expected a valid marker operator (such as `>=` or `not in`), found `notin`
         name; '3.7' notin python_version
-                    ^^^^^"
+                    ^^^^^
+        "
         );
     }
 
@@ -1677,11 +1690,11 @@ mod tests {
     fn error_markers_inpython_version() {
         assert_snapshot!(
             parse_pep508_err("name; '3.6'inpython_version"),
-            @r#"
-    Expected a valid marker operator (such as `>=` or `not in`), found `inpython_version`
-    name; '3.6'inpython_version
-               ^^^^^^^^^^^^^^^^
-    "#
+            @"
+        Expected a valid marker operator (such as `>=` or `not in`), found `inpython_version`
+        name; '3.6'inpython_version
+                   ^^^^^^^^^^^^^^^^
+        "
         );
     }
 
@@ -1692,7 +1705,8 @@ mod tests {
             @"
         Expected `i`, found `p`
         name; '3.7' not python_version
-                        ^"
+                        ^
+        "
         );
     }
 
@@ -1703,7 +1717,8 @@ mod tests {
             @"
         Expected a valid marker operator (such as `>=` or `not in`), found `~`
         name; '3.7' ~ python_version
-                    ^"
+                    ^
+        "
         );
     }
 
@@ -1711,11 +1726,11 @@ mod tests {
     fn error_invalid_prerelease() {
         assert_snapshot!(
             parse_pep508_err("name==1.0.org1"),
-            @r###"
-    after parsing `1.0`, found `.org1`, which is not part of a valid version
-    name==1.0.org1
-        ^^^^^^^^^^
-    "###
+            @"
+        after parsing `1.0`, found `.org1`, which is not part of a valid version
+        name==1.0.org1
+            ^^^^^^^^^^
+        "
         );
     }
 
@@ -1726,7 +1741,8 @@ mod tests {
             @"
         Unexpected end of version specifier, expected version
         name==
-            ^^"
+            ^^
+        "
         );
     }
 
@@ -1734,11 +1750,11 @@ mod tests {
     fn error_no_version_operator() {
         assert_snapshot!(
             parse_pep508_err("name 1.0"),
-            @r#"
-    Expected one of `@`, `(`, `<`, `=`, `>`, `~`, `!`, `;`, found `1`
-    name 1.0
-         ^
-    "#
+            @"
+        Expected one of `@`, `(`, `<`, `=`, `>`, `~`, `!`, `;`, found `1`
+        name 1.0
+             ^
+        "
         );
     }
 
@@ -1746,11 +1762,11 @@ mod tests {
     fn error_random_char() {
         assert_snapshot!(
             parse_pep508_err("name >= 1.0 #"),
-            @r##"
-    Trailing `#` is not allowed
-    name >= 1.0 #
-         ^^^^^^^^
-    "##
+            @"
+        Trailing `#` is not allowed
+        name >= 1.0 #
+             ^^^^^^^^
+        "
         );
     }
 
@@ -1759,11 +1775,11 @@ mod tests {
     fn error_invalid_extra_unnamed_url() {
         assert_snapshot!(
             parse_unnamed_err("/foo-3.0.0-py3-none-any.whl[d,]"),
-            @r#"
-    Expected an alphanumeric character starting the extra name, found `]`
-    /foo-3.0.0-py3-none-any.whl[d,]
-                                  ^
-    "#
+            @"
+        Expected an alphanumeric character starting the extra name, found `]`
+        /foo-3.0.0-py3-none-any.whl[d,]
+                                      ^
+        "
         );
     }
 
@@ -1777,7 +1793,7 @@ mod tests {
             "foo @ file:foo-3.0.0-py3-none-any.whl",
             "foo @ ./foo-3.0.0-py3-none-any.whl",
         ];
-        let cwd = env::current_dir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
 
         for requirement in requirements {
             assert_eq!(

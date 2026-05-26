@@ -5,11 +5,12 @@ use indoc::{formatdoc, indoc};
 use insta::assert_snapshot;
 use url::Url;
 
-use crate::common::{TestContext, uv_snapshot};
+use uv_static::EnvVars;
+use uv_test::uv_snapshot;
 
 #[test]
 fn nested_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -24,7 +25,7 @@ fn nested_dependencies() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -38,7 +39,7 @@ fn nested_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -50,7 +51,7 @@ fn nested_dependencies() -> Result<()> {
 
 #[test]
 fn nested_platform_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -65,7 +66,7 @@ fn nested_platform_dependencies() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--python-platform").arg("linux"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--python-platform").arg("linux"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -82,10 +83,10 @@ fn nested_platform_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 12 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -105,7 +106,7 @@ fn nested_platform_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 12 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -117,7 +118,7 @@ fn nested_platform_dependencies() -> Result<()> {
 
 #[test]
 fn invert() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -132,7 +133,7 @@ fn invert() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -149,10 +150,10 @@ fn invert() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--no-dedupe"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--no-dedupe"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -171,7 +172,7 @@ fn invert() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###
+    "
     );
 
     Ok(())
@@ -179,7 +180,7 @@ fn invert() -> Result<()> {
 
 #[test]
 fn frozen() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -192,7 +193,7 @@ fn frozen() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -203,7 +204,7 @@ fn frozen() -> Result<()> {
 
     ----- stderr -----
     Resolved 4 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -223,7 +224,7 @@ fn frozen() -> Result<()> {
     )?;
 
     // Running with `--frozen` should show the stale tree.
-    uv_snapshot!(context.filters(), context.tree().arg("--frozen"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--frozen"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -233,7 +234,7 @@ fn frozen() -> Result<()> {
         └── sniffio v1.3.1
 
     ----- stderr -----
-    "###
+    "
     );
 
     Ok(())
@@ -241,7 +242,7 @@ fn frozen() -> Result<()> {
 
 #[test]
 fn outdated() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -254,7 +255,7 @@ fn outdated() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--outdated").arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--outdated").arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -265,7 +266,70 @@ fn outdated() -> Result<()> {
 
     ----- stderr -----
     Resolved 4 packages in [TIME]
-    "###
+    "
+    );
+
+    Ok(())
+}
+
+/// Test that `uv tree --outdated` with a relative `exclude-newer` span recomputes the
+/// cutoff timestamp relative to the current time, not the time the lock was generated.
+///
+/// Uses idna which has releases at:
+/// - 3.6: 2023-11-25
+/// - 3.7: 2024-04-11
+#[test]
+fn outdated_exclude_newer_relative() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["idna"]
+    "#,
+    )?;
+
+    // Lock at 2024-05-01 with `--exclude-newer "3 weeks"`.
+    // Cutoff: 2024-04-10 → resolves idna 3.6 (released 2023-11-25, before cutoff).
+    // idna 3.7 (released 2024-04-11) is excluded.
+    uv_snapshot!(context.filters(), context
+        .lock()
+        .env_remove(EnvVars::UV_EXCLUDE_NEWER)
+        .env(EnvVars::UV_TEST_CURRENT_TIMESTAMP, "2024-05-01T00:00:00Z")
+        .arg("--exclude-newer")
+        .arg("3 weeks"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    // Run `--outdated` at a later time (2024-06-01) with the same span.
+    // The recomputed cutoff is 2024-05-11, which is after idna 3.7 (2024-04-11),
+    // so idna 3.7 should be reported as the latest version.
+    uv_snapshot!(context.filters(), context
+        .tree()
+        .arg("--outdated")
+        .arg("--universal")
+        .env_remove(EnvVars::UV_EXCLUDE_NEWER)
+        .env(EnvVars::UV_TEST_CURRENT_TIMESTAMP, "2024-06-01T00:00:00Z")
+        .arg("--exclude-newer")
+        .arg("3 weeks"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    └── idna v3.6 (latest: v3.7)
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    "
     );
 
     Ok(())
@@ -273,7 +337,7 @@ fn outdated() -> Result<()> {
 
 #[test]
 fn platform_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -290,7 +354,7 @@ fn platform_dependencies() -> Result<()> {
 
     // When `--universal` is _not_ provided, `colorama` should _not_ be included.
     #[cfg(not(windows))]
-    uv_snapshot!(context.filters(), context.tree(), @r###"
+    uv_snapshot!(context.filters(), context.tree(), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -304,10 +368,10 @@ fn platform_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 8 packages in [TIME]
-    "###);
+    ");
 
     // Unless `--python-platform` is set to `windows`, in which case it should be included.
-    uv_snapshot!(context.filters(), context.tree().arg("--python-platform").arg("windows"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--python-platform").arg("windows"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -322,11 +386,11 @@ fn platform_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 8 packages in [TIME]
-    "###);
+    ");
 
     // When `--universal` is _not_ provided, should include `colorama`, even though it's only
     // included on Windows.
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -341,7 +405,7 @@ fn platform_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 8 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -353,7 +417,7 @@ fn platform_dependencies() -> Result<()> {
 
 #[test]
 fn platform_dependencies_inverted() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -369,7 +433,7 @@ fn platform_dependencies_inverted() -> Result<()> {
     )?;
 
     // When `--universal` is _not_ provided, `colorama` should _not_ be included.
-    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--python-platform").arg("linux"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--python-platform").arg("linux"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -378,10 +442,10 @@ fn platform_dependencies_inverted() -> Result<()> {
 
     ----- stderr -----
     Resolved 3 packages in [TIME]
-    "###);
+    ");
 
     // Unless `--python-platform` is set to `windows`, in which case it should be included.
-    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--python-platform").arg("windows"), @r#"
+    uv_snapshot!(context.filters(), context.tree().arg("--invert").arg("--python-platform").arg("windows"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -391,14 +455,14 @@ fn platform_dependencies_inverted() -> Result<()> {
 
     ----- stderr -----
     Resolved 3 packages in [TIME]
-    "#);
+    ");
 
     Ok(())
 }
 
 #[test]
 fn repeated_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -415,7 +479,7 @@ fn repeated_dependencies() -> Result<()> {
     )?;
 
     // Should include both versions of `anyio`, which have different dependencies.
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -430,7 +494,7 @@ fn repeated_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -444,7 +508,7 @@ fn repeated_dependencies() -> Result<()> {
 /// URLs.
 #[test]
 fn repeated_version() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let v1 = context.temp_dir.child("v1");
     fs_err::create_dir_all(&v1)?;
@@ -488,7 +552,7 @@ fn repeated_version() -> Result<()> {
         Url::from_file_path(context.temp_dir.join("v2")).unwrap(),
     })?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -504,7 +568,7 @@ fn repeated_version() -> Result<()> {
 
     ----- stderr -----
     Resolved 7 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -516,7 +580,7 @@ fn repeated_version() -> Result<()> {
 
 #[test]
 fn dev_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -532,7 +596,7 @@ fn dev_dependencies() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree(), @r###"
+    uv_snapshot!(context.filters(), context.tree(), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -543,11 +607,12 @@ fn dev_dependencies() -> Result<()> {
         └── sniffio v1.3.1
 
     ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--no-dev"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--no-dev"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -555,8 +620,9 @@ fn dev_dependencies() -> Result<()> {
     └── iniconfig v2.0.0
 
     ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -568,7 +634,7 @@ fn dev_dependencies() -> Result<()> {
 
 #[test]
 fn dev_dependencies_inverted() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -584,7 +650,7 @@ fn dev_dependencies_inverted() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -598,11 +664,12 @@ fn dev_dependencies_inverted() -> Result<()> {
     (*) Package tree already displayed
 
     ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert").arg("--no-dev"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert").arg("--no-dev"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -610,8 +677,9 @@ fn dev_dependencies_inverted() -> Result<()> {
     └── project v0.1.0
 
     ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -623,7 +691,7 @@ fn dev_dependencies_inverted() -> Result<()> {
 
 #[test]
 fn optional_dependencies() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -639,7 +707,7 @@ fn optional_dependencies() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -661,7 +729,7 @@ fn optional_dependencies() -> Result<()> {
 
     ----- stderr -----
     Resolved 14 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -673,7 +741,7 @@ fn optional_dependencies() -> Result<()> {
 
 #[test]
 fn optional_dependencies_inverted() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -689,7 +757,7 @@ fn optional_dependencies_inverted() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -719,7 +787,7 @@ fn optional_dependencies_inverted() -> Result<()> {
 
     ----- stderr -----
     Resolved 14 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -729,9 +797,243 @@ fn optional_dependencies_inverted() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for <https://github.com/astral-sh/uv/issues/19327>.
+///
+/// When a package is required both as a plain dep and as a dep with extras (e.g., from a
+/// dependency group), `uv tree` should not display extra-conditional dependencies for the plain
+/// occurrence.
+#[test]
+fn dep_and_group_extras() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["flask"]
+
+        [dependency-groups]
+        dev = ["flask[dotenv]"]
+    "#,
+    )?;
+
+    // Plain `flask` should not show `python-dotenv` (which belongs to the `dotenv` extra),
+    // but the `flask[dotenv]` occurrence should still be expanded in its own extra context.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── flask v3.0.2
+    │   ├── blinker v1.7.0
+    │   ├── click v8.1.7
+    │   │   └── colorama v0.4.6
+    │   ├── itsdangerous v2.1.2
+    │   ├── jinja2 v3.1.3
+    │   │   └── markupsafe v2.1.5
+    │   └── werkzeug v3.0.1
+    │       └── markupsafe v2.1.5
+    └── flask[dotenv] v3.0.2 (group: dev)
+        ├── blinker v1.7.0
+        ├── click v8.1.7 (*)
+        ├── itsdangerous v2.1.2
+        ├── jinja2 v3.1.3 (*)
+        ├── werkzeug v3.0.1 (*)
+        └── python-dotenv v1.0.1 (extra: dotenv)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 10 packages in [TIME]
+    "
+    );
+
+    // With `--no-dedupe`, `flask[dotenv]` is expanded and shows `python-dotenv` as an extra dep,
+    // while plain `flask` still does not show it.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--no-dedupe"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── flask v3.0.2
+    │   ├── blinker v1.7.0
+    │   ├── click v8.1.7
+    │   │   └── colorama v0.4.6
+    │   ├── itsdangerous v2.1.2
+    │   ├── jinja2 v3.1.3
+    │   │   └── markupsafe v2.1.5
+    │   └── werkzeug v3.0.1
+    │       └── markupsafe v2.1.5
+    └── flask[dotenv] v3.0.2 (group: dev)
+        ├── blinker v1.7.0
+        ├── click v8.1.7
+        │   └── colorama v0.4.6
+        ├── itsdangerous v2.1.2
+        ├── jinja2 v3.1.3
+        │   └── markupsafe v2.1.5
+        ├── werkzeug v3.0.1
+        │   └── markupsafe v2.1.5
+        └── python-dotenv v1.0.1 (extra: dotenv)
+
+    ----- stderr -----
+    Resolved 10 packages in [TIME]
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dep_and_group_extras_with_extra_only_dependency() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let leaf = context.temp_dir.child("leaf");
+    fs_err::create_dir_all(leaf.path())?;
+    leaf.child("pyproject.toml").write_str(
+        r#"
+        [project]
+        name = "leaf"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        "#,
+    )?;
+    let leaf_url = Url::from_file_path(leaf.path())
+        .map_err(|()| anyhow::anyhow!("failed to convert leaf path to URL"))?;
+
+    let child = context.temp_dir.child("child");
+    fs_err::create_dir_all(child.path())?;
+    child.child("pyproject.toml").write_str(&formatdoc! {
+        r#"
+        [project]
+        name = "child"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        extra = ["leaf @ {}"]
+        "#,
+        leaf_url,
+    })?;
+    let child_url = Url::from_file_path(child.path())
+        .map_err(|()| anyhow::anyhow!("failed to convert child path to URL"))?;
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(&formatdoc! {
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["child @ {}"]
+
+        [dependency-groups]
+        dev = ["child[extra] @ {}"]
+        "#,
+        child_url,
+        child_url,
+    })?;
+
+    uv_snapshot!(context.filters(), context.tree(), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── child v0.1.0
+    └── child[extra] v0.1.0 (group: dev)
+        └── leaf v0.1.0 (extra: extra)
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn dep_and_group_extras_with_different_extras_in_path() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let leaf = context.temp_dir.child("leaf");
+    fs_err::create_dir_all(leaf.path())?;
+    leaf.child("pyproject.toml").write_str(
+        r#"
+        [project]
+        name = "leaf"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        "#,
+    )?;
+    let leaf_url = Url::from_file_path(leaf.path())
+        .map_err(|()| anyhow::anyhow!("failed to convert leaf path to URL"))?;
+
+    let a = context.temp_dir.child("a");
+    fs_err::create_dir_all(a.path())?;
+    let b = context.temp_dir.child("b");
+    fs_err::create_dir_all(b.path())?;
+    let b_url = Url::from_file_path(b.path())
+        .map_err(|()| anyhow::anyhow!("failed to convert b path to URL"))?;
+    a.child("pyproject.toml").write_str(&formatdoc! {
+        r#"
+        [project]
+        name = "a"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["b[extra2] @ {}"]
+        "#,
+        b_url,
+    })?;
+    let a_url = Url::from_file_path(a.path())
+        .map_err(|()| anyhow::anyhow!("failed to convert a path to URL"))?;
+
+    b.child("pyproject.toml").write_str(&formatdoc! {
+        r#"
+        [project]
+        name = "b"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        extra1 = ["a @ {}"]
+        extra2 = ["leaf @ {}"]
+        "#,
+        a_url,
+        leaf_url,
+    })?;
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(&formatdoc! {
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["b[extra1] @ {}"]
+        "#,
+        b_url,
+    })?;
+
+    uv_snapshot!(context.filters(), context.tree(), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    └── b[extra1] v0.1.0
+        └── a v0.1.0 (extra: extra1)
+            └── b[extra2] v0.1.0
+                └── leaf v0.1.0 (extra: extra2)
+
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
 #[test]
 fn package() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -744,7 +1046,7 @@ fn package() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree(), @r###"
+    uv_snapshot!(context.filters(), context.tree(), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -764,10 +1066,10 @@ fn package() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("scipy"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("scipy"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -776,10 +1078,10 @@ fn package() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("numpy").arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("numpy").arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -794,7 +1096,7 @@ fn package() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -806,7 +1108,7 @@ fn package() -> Result<()> {
 
 #[test]
 fn group() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -826,7 +1128,7 @@ fn group() -> Result<()> {
 
     context.lock().assert().success();
 
-    uv_snapshot!(context.filters(), context.tree(), @r###"
+    uv_snapshot!(context.filters(), context.tree(), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -836,9 +1138,9 @@ fn group() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###);
+    ");
 
-    uv_snapshot!(context.filters(), context.tree().arg("--only-group").arg("bar"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--only-group").arg("bar"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -847,9 +1149,9 @@ fn group() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###);
+    ");
 
-    uv_snapshot!(context.filters(), context.tree().arg("--group").arg("foo"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--group").arg("foo"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -862,25 +1164,9 @@ fn group() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###);
+    ");
 
-    uv_snapshot!(context.filters(), context.tree().arg("--group").arg("foo").arg("--group").arg("bar"), @r###"
-    success: true
-    exit_code: 0
-    ----- stdout -----
-    project v0.1.0
-    ├── typing-extensions v4.10.0
-    ├── iniconfig v2.0.0 (group: bar)
-    ├── sniffio v1.3.1 (group: dev)
-    └── anyio v4.3.0 (group: foo)
-        ├── idna v3.6
-        └── sniffio v1.3.1
-
-    ----- stderr -----
-    Resolved 6 packages in [TIME]
-    "###);
-
-    uv_snapshot!(context.filters(), context.tree().arg("--all-groups"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--group").arg("foo").arg("--group").arg("bar"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -894,9 +1180,25 @@ fn group() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###);
+    ");
 
-    uv_snapshot!(context.filters(), context.tree().arg("--all-groups").arg("--no-group").arg("bar"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--all-groups"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── typing-extensions v4.10.0
+    ├── iniconfig v2.0.0 (group: bar)
+    ├── sniffio v1.3.1 (group: dev)
+    └── anyio v4.3.0 (group: foo)
+        ├── idna v3.6
+        └── sniffio v1.3.1
+
+    ----- stderr -----
+    Resolved 6 packages in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.tree().arg("--all-groups").arg("--no-group").arg("bar"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -909,14 +1211,14 @@ fn group() -> Result<()> {
 
     ----- stderr -----
     Resolved 6 packages in [TIME]
-    "###);
+    ");
 
     Ok(())
 }
 
 #[test]
 fn cycle() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -929,7 +1231,7 @@ fn cycle() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -954,10 +1256,10 @@ fn cycle() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("traceback2").arg("--package").arg("six"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("traceback2").arg("--package").arg("six"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -967,10 +1269,10 @@ fn cycle() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("traceback2").arg("--package").arg("six").arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("traceback2").arg("--package").arg("six").arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -990,7 +1292,7 @@ fn cycle() -> Result<()> {
 
     ----- stderr -----
     Resolved 11 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -1001,8 +1303,267 @@ fn cycle() -> Result<()> {
 }
 
 #[test]
+fn cycle_no_orphaned_roots() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // With --depth 1, only "project" should appear as a root — transitive deps
+    // involved in cycles (e.g. testtools <-> fixtures) must not be promoted to roots.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--depth").arg("1"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── fixtures v3.0.0
+    └── testtools v2.3.0
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    "###);
+
+    Ok(())
+}
+
+#[test]
+fn cycle_no_infinite_loop() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // This should complete without hanging, and cycles should be marked with (*)
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--depth").arg("2"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── fixtures v3.0.0
+    │   ├── pbr v6.0.0
+    │   ├── six v1.16.0
+    │   └── testtools v2.3.0
+    └── testtools v2.3.0
+        ├── extras v1.0.0
+        ├── fixtures v3.0.0 (*)
+        ├── pbr v6.0.0
+        ├── python-mimeparse v1.6.0
+        ├── six v1.16.0
+        ├── traceback2 v1.4.0
+        └── unittest2 v1.1.0
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    "###
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cycle_invert() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // With --invert, leaf packages should be roots and the tree should show
+    // reverse dependencies without orphaned roots from cycle-breaking.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert").arg("--depth").arg("1"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    argparse v1.4.0
+    └── unittest2 v1.1.0
+    extras v1.0.0
+    └── testtools v2.3.0
+    linecache2 v1.0.0
+    └── traceback2 v1.4.0
+    pbr v6.0.0
+    ├── fixtures v3.0.0
+    └── testtools v2.3.0
+    python-mimeparse v1.6.0
+    └── testtools v2.3.0
+    six v1.16.0
+    ├── fixtures v3.0.0
+    ├── testtools v2.3.0
+    └── unittest2 v1.1.0
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    "###);
+
+    Ok(())
+}
+
+#[test]
+fn cycle_depth_boundary_no_premature_dedupe() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // With --depth 3, packages at the depth boundary (depth 3) are shown but not
+    // marked as visited. Packages below the boundary (e.g., `fixtures` at depth 1)
+    // are correctly marked visited and show (*) on later appearances. Leaf packages
+    // like `pbr` (no children in this graph) appear without (*) even when visited,
+    // since there is nothing to deduplicate.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--depth").arg("3"), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── fixtures v3.0.0
+    │   ├── pbr v6.0.0
+    │   ├── six v1.16.0
+    │   └── testtools v2.3.0
+    │       ├── extras v1.0.0
+    │       ├── fixtures v3.0.0 (*)
+    │       ├── pbr v6.0.0
+    │       ├── python-mimeparse v1.6.0
+    │       ├── six v1.16.0
+    │       ├── traceback2 v1.4.0
+    │       └── unittest2 v1.1.0
+    └── testtools v2.3.0 (*)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn cycle_invert_deep() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // With --invert and --depth 2, cycles in the reversed graph should be
+    // detected and marked with (*) without causing infinite loops.
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert").arg("--depth").arg("2"), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    argparse v1.4.0
+    └── unittest2 v1.1.0
+        └── testtools v2.3.0
+    extras v1.0.0
+    └── testtools v2.3.0
+        ├── fixtures v3.0.0
+        └── project v0.1.0
+    linecache2 v1.0.0
+    └── traceback2 v1.4.0
+        ├── testtools v2.3.0 (*)
+        └── unittest2 v1.1.0 (*)
+    pbr v6.0.0
+    ├── fixtures v3.0.0
+    │   ├── project v0.1.0
+    │   └── testtools v2.3.0 (*)
+    └── testtools v2.3.0 (*)
+    python-mimeparse v1.6.0
+    └── testtools v2.3.0 (*)
+    six v1.16.0
+    ├── fixtures v3.0.0 (*)
+    ├── testtools v2.3.0 (*)
+    └── unittest2 v1.1.0 (*)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn cycle_depth_no_dedupe() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["testtools==2.3.0", "fixtures==3.0.0"]
+    "#,
+    )?;
+
+    // With --no-dedupe and --depth 2, packages should be expanded each time they
+    // appear (up to the depth limit), and cycles should still be marked with (*).
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--no-dedupe").arg("--depth").arg("2"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    ├── fixtures v3.0.0
+    │   ├── pbr v6.0.0
+    │   ├── six v1.16.0
+    │   └── testtools v2.3.0
+    └── testtools v2.3.0
+        ├── extras v1.0.0
+        ├── fixtures v3.0.0
+        ├── pbr v6.0.0
+        ├── python-mimeparse v1.6.0
+        ├── six v1.16.0
+        ├── traceback2 v1.4.0
+        └── unittest2 v1.1.0
+
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    "###);
+
+    Ok(())
+}
+
+#[test]
 fn workspace_dev() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -1036,7 +1597,7 @@ fn workspace_dev() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1056,7 +1617,7 @@ fn workspace_dev() -> Result<()> {
 
     // Under `--no-dev`, the member should still be included, since we show the entire workspace.
     // But it shouldn't be considered a dependency of the root.
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--no-dev"), @r"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--no-dev"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1081,7 +1642,7 @@ fn workspace_dev() -> Result<()> {
 
 #[test]
 fn non_project() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -1094,7 +1655,7 @@ fn non_project() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1105,7 +1666,7 @@ fn non_project() -> Result<()> {
     ----- stderr -----
     warning: No `requires-python` value found in the workspace. Defaulting to `>=3.12`.
     Resolved 3 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -1117,7 +1678,7 @@ fn non_project() -> Result<()> {
 
 #[test]
 fn non_project_member() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -1140,12 +1701,12 @@ fn non_project_member() -> Result<()> {
         dependencies = ["iniconfig", "sniffio", "anyio"]
 
         [build-system]
-        requires = ["setuptools>=42"]
-        build-backend = "setuptools.build_meta"
+        requires = ["uv_build>=0.7,<10000"]
+        build-backend = "uv_build"
         "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1160,10 +1721,10 @@ fn non_project_member() -> Result<()> {
 
     ----- stderr -----
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--invert"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1179,7 +1740,7 @@ fn non_project_member() -> Result<()> {
 
     ----- stderr -----
     Resolved 5 packages in [TIME]
-    "###
+    "
     );
 
     // `uv tree` should update the lockfile
@@ -1191,7 +1752,7 @@ fn non_project_member() -> Result<()> {
 
 #[test]
 fn script() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let script = context.temp_dir.child("script.py");
     script.write_str(indoc! {r#"
@@ -1211,7 +1772,7 @@ fn script() -> Result<()> {
         pprint([(k, v["title"]) for k, v in data.items()][:10])
     "#})?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--script").arg(script.path()), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--script").arg(script.path()), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1227,20 +1788,20 @@ fn script() -> Result<()> {
 
     ----- stderr -----
     Resolved 9 packages in [TIME]
-    "###);
+    ");
 
     // If the lockfile didn't exist already, it shouldn't be persisted to disk.
     assert!(!context.temp_dir.child("uv.lock").exists());
 
     // Explicitly lock the script.
-    uv_snapshot!(context.filters(), context.lock().arg("--script").arg(script.path()), @r###"
+    uv_snapshot!(context.filters(), context.lock().arg("--script").arg(script.path()), @"
     success: true
     exit_code: 0
     ----- stdout -----
 
     ----- stderr -----
     Resolved 9 packages in [TIME]
-    "###);
+    ");
 
     let lock = context.read("script.py.lock");
 
@@ -1409,7 +1970,7 @@ fn script() -> Result<()> {
     "#})?;
 
     // `uv tree` should update the lockfile.
-    uv_snapshot!(context.filters(), context.tree().arg("--script").arg(script.path()), @r###"
+    uv_snapshot!(context.filters(), context.tree().arg("--script").arg(script.path()), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1426,7 +1987,7 @@ fn script() -> Result<()> {
 
     ----- stderr -----
     Resolved 10 packages in [TIME]
-    "###);
+    ");
 
     let lock = context.read("script.py.lock");
 
@@ -1590,7 +2151,7 @@ fn script() -> Result<()> {
 
 #[test]
 fn only_group() -> Result<()> {
-    let context = TestContext::new("3.12");
+    let context = uv_test::test_context!("3.12");
 
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str(
@@ -1615,7 +2176,7 @@ fn only_group() -> Result<()> {
     "#,
     )?;
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @r"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1632,7 +2193,7 @@ fn only_group() -> Result<()> {
     "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--only-group").arg("dev"), @r"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--only-group").arg("dev"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1647,7 +2208,7 @@ fn only_group() -> Result<()> {
     "
     );
 
-    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--only-group").arg("test"), @r"
+    uv_snapshot!(context.filters(), context.tree().arg("--universal").arg("--only-group").arg("test"), @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1666,6 +2227,132 @@ fn only_group() -> Result<()> {
     // `uv tree` should update the lockfile
     let lock = context.read("uv.lock");
     assert!(!lock.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn show_sizes() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["iniconfig"]
+    "#,
+    )?;
+
+    uv_snapshot!(context.filters(), context.tree().arg("--show-sizes").arg("--universal"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    project v0.1.0
+    └── iniconfig v2.0.0 ([SIZE])
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn workspace_circular_dependencies() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    // Create workspace root
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"
+        [tool.uv.workspace]
+        members = ["packages/*"]
+    "#,
+    )?;
+
+    // Create package-a that depends on package-b
+    let package_a_dir = context.temp_dir.child("packages").child("package-a");
+    package_a_dir.create_dir_all()?;
+    let package_a_pyproject = package_a_dir.child("pyproject.toml");
+    package_a_pyproject.write_str(
+        r#"
+        [project]
+        name = "package-a"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["package-b"]
+
+        [tool.uv.sources]
+        package-b = { workspace = true }
+    "#,
+    )?;
+
+    // Create package-b that depends on package-a (circular dependency)
+    let package_b_dir = context.temp_dir.child("packages").child("package-b");
+    package_b_dir.create_dir_all()?;
+    let package_b_pyproject = package_b_dir.child("pyproject.toml");
+    package_b_pyproject.write_str(
+        r#"
+        [project]
+        name = "package-b"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["package-a"]
+
+        [tool.uv.sources]
+        package-a = { workspace = true }
+    "#,
+    )?;
+
+    // Test that package-a is at the root when requested
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("package-a"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    package-a v0.1.0
+    └── package-b v0.1.0
+        └── package-a v0.1.0 (*)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    "
+    );
+
+    // Test that package-b is at the root when requested
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("package-b"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    package-b v0.1.0
+    └── package-a v0.1.0
+        └── package-b v0.1.0 (*)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    "
+    );
+
+    // Test that both packages are shown as roots when both are requested
+    uv_snapshot!(context.filters(), context.tree().arg("--package").arg("package-a").arg("--package").arg("package-b"), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    package-a v0.1.0
+    └── package-b v0.1.0
+        └── package-a v0.1.0 (*)
+    package-b v0.1.0 (*)
+    (*) Package tree already displayed
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    "
+    );
 
     Ok(())
 }

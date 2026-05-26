@@ -15,27 +15,30 @@ use tracing::{debug, warn};
 use uv_cache::{Cache, Refresh};
 use uv_cache_info::Timestamp;
 use uv_cli::ExternalCommand;
-use uv_client::BaseClientBuilder;
-use uv_configuration::Constraints;
-use uv_configuration::{Concurrency, Preview};
+use uv_client::{BaseClientBuilder, RegistryClientBuilder};
+use uv_configuration::{Concurrency, Constraints, GitLfsSetting, TargetTriple};
 use uv_distribution::LoweredExtraBuildDependencies;
 use uv_distribution_types::InstalledDist;
 use uv_distribution_types::{
-    IndexUrl, Name, NameRequirementSpecification, Requirement, RequirementSource,
-    UnresolvedRequirement, UnresolvedRequirementSpecification,
+    IndexCapabilities, IndexUrl, Name, NameRequirementSpecification, Requirement,
+    RequirementSource, UnresolvedRequirement, UnresolvedRequirementSpecification,
 };
+use uv_fs::CWD;
 use uv_fs::Simplified;
-use uv_installer::{SatisfiesResult, SitePackages};
+use uv_installer::{InstallationStrategy, SatisfiesResult, SitePackages};
 use uv_normalize::PackageName;
 use uv_pep440::{VersionSpecifier, VersionSpecifiers};
 use uv_pep508::MarkerTree;
+use uv_preview::Preview;
+use uv_python::PythonVersionFile;
+use uv_python::VersionFileDiscoveryOptions;
 use uv_python::{
     EnvironmentPreference, PythonDownloads, PythonEnvironment, PythonInstallation,
     PythonPreference, PythonRequest,
 };
 use uv_requirements::{RequirementsSource, RequirementsSpecification};
 use uv_settings::{PythonInstallMirrors, ResolverInstallerOptions, ToolOptions};
-use uv_shell::runnable::WindowsRunnable;
+use uv_shell::WindowsRunnable;
 use uv_static::EnvVars;
 use uv_tool::{InstalledTools, entrypoint_paths};
 use uv_warnings::warn_user;
@@ -44,6 +47,9 @@ use uv_workspace::WorkspaceCache;
 
 use crate::child::run_to_completion;
 use crate::commands::ExitStatus;
+
+use crate::commands::pip;
+use crate::commands::pip::latest::LatestClient;
 use crate::commands::pip::loggers::{
     DefaultInstallLogger, DefaultResolveLogger, SummaryInstallLogger, SummaryResolveLogger,
 };
@@ -57,7 +63,7 @@ use crate::commands::tool::{Target, ToolRequest};
 use crate::commands::{diagnostics, project::environment::CachedEnvironment};
 use crate::printer::Printer;
 use crate::settings::ResolverInstallerSettings;
-use crate::settings::{NetworkSettings, ResolverSettings};
+use crate::settings::ResolverSettings;
 
 /// The user-facing command used to invoke a tool run.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -77,48 +83,58 @@ impl Display for ToolRunCommand {
     }
 }
 
-/// Run a command.
-#[allow(clippy::fn_params_excessive_bools)]
-pub(crate) async fn run(
-    command: Option<ExternalCommand>,
-    from: Option<String>,
-    with: &[RequirementsSource],
-    constraints: &[RequirementsSource],
-    overrides: &[RequirementsSource],
-    build_constraints: &[RequirementsSource],
-    show_resolution: bool,
-    python: Option<String>,
-    install_mirrors: PythonInstallMirrors,
-    options: ResolverInstallerOptions,
-    settings: ResolverInstallerSettings,
-    network_settings: NetworkSettings,
-    invocation_source: ToolRunCommand,
-    isolated: bool,
-    python_preference: PythonPreference,
-    python_downloads: PythonDownloads,
-    installer_metadata: bool,
-    concurrency: Concurrency,
-    cache: Cache,
-    printer: Printer,
-    env_file: Vec<PathBuf>,
+/// Read dotenv files into an overlay for the spawned tool process.
+///
+/// These values intentionally do not mutate uv's process environment and cannot mutate
+/// the current uv process' settings.
+fn read_env_files(
+    env_file: &[PathBuf],
     no_env_file: bool,
-    preview: Preview,
-) -> anyhow::Result<ExitStatus> {
-    /// Whether or not a path looks like a Python script based on the file extension.
-    fn has_python_script_ext(path: &Path) -> bool {
-        path.extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("py") || ext.eq_ignore_ascii_case("pyw"))
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut environment = Vec::new();
+
+    if no_env_file {
+        return Ok(environment);
     }
 
-    // Read from the `.env` file, if necessary.
-    if !no_env_file {
-        for env_file_path in env_file.iter().rev().map(PathBuf::as_path) {
-            match dotenvy::from_path(env_file_path) {
-                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                    bail!(
-                        "No environment file found at: `{}`",
-                        env_file_path.simplified_display()
-                    );
+    for env_file_path in env_file.iter().rev().map(PathBuf::as_path) {
+        let iter = match dotenvy::from_path_iter(env_file_path) {
+            Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "No environment file found at: `{}`",
+                    env_file_path.simplified_display()
+                );
+            }
+            Err(dotenvy::Error::Io(err)) => {
+                bail!(
+                    "Failed to read environment file `{}`: {err}",
+                    env_file_path.simplified_display()
+                );
+            }
+            Err(dotenvy::Error::LineParse(content, position)) => {
+                warn_user!(
+                    "Failed to parse environment file `{}` at position {position}: {content}",
+                    env_file_path.simplified_display(),
+                );
+                continue;
+            }
+            Err(err) => {
+                warn_user!(
+                    "Failed to parse environment file `{}`: {err}",
+                    env_file_path.simplified_display(),
+                );
+                continue;
+            }
+            Ok(iter) => iter,
+        };
+
+        let mut parsed = true;
+        for item in iter {
+            match item {
+                Ok((key, value)) => {
+                    if std::env::var(&key).is_err() {
+                        environment.push((key, value));
+                    }
                 }
                 Err(dotenvy::Error::Io(err)) => {
                     bail!(
@@ -131,22 +147,92 @@ pub(crate) async fn run(
                         "Failed to parse environment file `{}` at position {position}: {content}",
                         env_file_path.simplified_display(),
                     );
+                    parsed = false;
+                    break;
                 }
                 Err(err) => {
                     warn_user!(
                         "Failed to parse environment file `{}`: {err}",
                         env_file_path.simplified_display(),
                     );
-                }
-                Ok(()) => {
-                    debug!(
-                        "Read environment file at: `{}`",
-                        env_file_path.simplified_display()
-                    );
+                    parsed = false;
+                    break;
                 }
             }
         }
+
+        if parsed {
+            debug!(
+                "Read environment file at: `{}`",
+                env_file_path.simplified_display()
+            );
+        }
     }
+
+    // `dotenvy::from_path` preserves the first loaded value, while `Command::envs` preserves the
+    // last value set for the child process.
+    environment.reverse();
+
+    Ok(environment)
+}
+
+/// Check if the given arguments contain a verbose flag (e.g., `--verbose`, `-v`, `-vv`, etc.)
+fn find_verbose_flag(args: &[std::ffi::OsString]) -> Option<&str> {
+    args.iter().find_map(|arg| {
+        let arg_str = arg.to_str()?;
+        if arg_str == "--verbose" {
+            Some("--verbose")
+        } else if arg_str.starts_with("-v") && arg_str.chars().skip(1).all(|c| c == 'v') {
+            Some(arg_str)
+        } else {
+            None
+        }
+    })
+}
+
+/// Run a command.
+#[expect(clippy::fn_params_excessive_bools)]
+pub(crate) async fn run(
+    command: Option<ExternalCommand>,
+    from: Option<String>,
+    with: &[RequirementsSource],
+    constraints: &[RequirementsSource],
+    overrides: &[RequirementsSource],
+    build_constraints: &[RequirementsSource],
+    show_resolution: bool,
+    lfs: GitLfsSetting,
+    python: Option<String>,
+    python_platform: Option<TargetTriple>,
+    install_mirrors: PythonInstallMirrors,
+    options: ResolverInstallerOptions,
+    settings: ResolverInstallerSettings,
+    client_builder: BaseClientBuilder<'_>,
+    invocation_source: ToolRunCommand,
+    isolated: bool,
+    python_preference: PythonPreference,
+    python_downloads: PythonDownloads,
+    installer_metadata: bool,
+    concurrency: Concurrency,
+    cache: Cache,
+    workspace_cache: WorkspaceCache,
+    printer: Printer,
+    env_file: Vec<PathBuf>,
+    no_env_file: bool,
+    preview: Preview,
+) -> anyhow::Result<ExitStatus> {
+    /// Whether or not a path looks like a Python script based on the file extension.
+    fn has_python_script_ext(path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("py") || ext.eq_ignore_ascii_case("pyw"))
+    }
+
+    if settings.resolver.torch_backend.is_some() {
+        warn_user_once!(
+            "The `--torch-backend` option is experimental and may change without warning."
+        );
+    }
+
+    let env_file_environment = read_env_files(&env_file, no_env_file)?;
 
     let Some(command) = command else {
         // When a command isn't provided, we'll show a brief help including available tools
@@ -169,19 +255,12 @@ pub(crate) async fn run(
     if let Some(ref from) = from {
         if has_python_script_ext(Path::new(from)) {
             let package_name = PackageName::from_str(from)?;
-            return Err(anyhow::anyhow!(
-                "It looks like you provided a Python script to `--from`, which is not supported\n\n{}{} If you meant to run a command from the `{}` package, use the normalized package name instead to disambiguate, e.g., `{}`",
-                "hint".bold().cyan(),
-                ":".bold(),
-                package_name.cyan(),
-                format!(
-                    "{} --from {} {}",
-                    invocation_source,
-                    package_name.cyan(),
-                    target
-                )
-                .green(),
-            ));
+            return Err(ToolRunScriptError::FromScript {
+                package_name,
+                target: target.to_string(),
+                invocation: invocation_source,
+            }
+            .into());
         }
     } else {
         let target_path = Path::new(target);
@@ -189,24 +268,19 @@ pub(crate) async fn run(
         // If the user tries to invoke `uvx script.py`, hint them towards `uv run`.
         if has_python_script_ext(target_path) {
             return if target_path.try_exists()? {
-                Err(anyhow::anyhow!(
-                    "It looks like you tried to run a Python script at `{}`, which is not supported by `{}`\n\n{}{} Use `{}` instead",
-                    target_path.user_display(),
-                    invocation_source,
-                    "hint".bold().cyan(),
-                    ":".bold(),
-                    format!("uv run {}", target_path.user_display().cyan()),
-                ))
+                Err(ToolRunScriptError::TargetScriptExists {
+                    path: target_path.to_path_buf(),
+                    invocation: invocation_source,
+                }
+                .into())
             } else {
                 let package_name = PackageName::from_str(target)?;
-                Err(anyhow::anyhow!(
-                    "It looks like you provided a Python script to run, which is not supported supported by `{}`\n\n{}{} We did not find a script at the requested path. If you meant to run a command from the `{}` package, pass the normalized package name to `--from` to disambiguate, e.g., `{}`",
-                    invocation_source,
-                    "hint".bold().cyan(),
-                    ":".bold(),
-                    package_name.cyan(),
-                    format!("{invocation_source} --from {package_name} {target}").green(),
-                ))
+                Err(ToolRunScriptError::TargetScriptMissing {
+                    package_name,
+                    target: target.to_string(),
+                    invocation: invocation_source,
+                }
+                .into())
             };
         }
     }
@@ -266,16 +340,19 @@ pub(crate) async fn run(
         build_constraints,
         show_resolution,
         python.as_deref(),
+        python_platform,
         install_mirrors,
         options,
         &settings,
-        &network_settings,
+        &client_builder,
         isolated,
+        lfs,
         python_preference,
         python_downloads,
         installer_metadata,
-        concurrency,
+        &concurrency,
         &cache,
+        &workspace_cache,
         printer,
         preview,
     ))
@@ -288,23 +365,38 @@ pub(crate) async fn run(
             // If the user ran `uvx run ...`, the `run` is likely a mistake. Show a dedicated hint.
             if from.is_none() && invocation_source == ToolRunCommand::Uvx && target == "run" {
                 let rest = args.iter().map(|s| s.to_string_lossy()).join(" ");
-                return diagnostics::OperationDiagnostic::native_tls(network_settings.native_tls)
-                    .with_hint(format!(
-                        "`{}` invokes the `{}` package. Did you mean `{}`?",
-                        format!("uvx run {rest}").green(),
-                        "run".cyan(),
-                        format!("uvx {rest}").green()
-                    ))
-                    .with_context("tool")
-                    .report(err)
-                    .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
-            }
-
-            return diagnostics::OperationDiagnostic::native_tls(network_settings.native_tls)
+                return diagnostics::OperationDiagnostic::with_system_certs(
+                    client_builder.system_certs(),
+                )
+                .with_hint(format!(
+                    "`{}` invokes the `{}` package. Did you mean `{}`?",
+                    format!("uvx run {rest}").green(),
+                    "run".cyan(),
+                    format!("uvx {rest}").green()
+                ))
                 .with_context("tool")
                 .report(err)
                 .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
+            }
+
+            let diagnostic =
+                diagnostics::OperationDiagnostic::with_system_certs(client_builder.system_certs());
+            let diagnostic = if let Some(verbose_flag) = find_verbose_flag(args) {
+                diagnostic.with_hint(format!(
+                    "You provided `{}` to `{}`. Did you mean to provide it to `{}`? e.g., `{}`",
+                    verbose_flag.cyan(),
+                    target.cyan(),
+                    invocation_source.to_string().cyan(),
+                    format!("{invocation_source} {verbose_flag} {target}").green()
+                ))
+            } else {
+                diagnostic.with_context("tool")
+            };
+            return diagnostic
+                .report(err)
+                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()));
         }
+
         Err(ProjectError::Requirements(err)) => {
             let err = miette::Report::msg(format!("{err}"))
                 .context("Failed to resolve `--with` requirement");
@@ -357,6 +449,7 @@ pub(crate) async fn run(
     };
 
     process.args(args);
+    process.envs(env_file_environment);
 
     // Construct the `PATH` environment variable.
     let new_path = std::env::join_paths(
@@ -439,7 +532,11 @@ async fn show_help(
     let installed_tools = InstalledTools::from_settings()?;
     let _lock = match installed_tools.lock().await {
         Ok(lock) => lock,
-        Err(uv_tool::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err)
+            if err
+                .as_io_error()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
             writeln!(printer.stdout(), "{help}")?;
             return Ok(());
         }
@@ -453,8 +550,10 @@ async fn show_help(
         .filter_map(|(name, tool)| {
             tool.ok().and_then(|_| {
                 installed_tools
-                    .version(&name, cache)
+                    .get_environment(&name, cache)
                     .ok()
+                    .flatten()
+                    .and_then(|tool_env| tool_env.version().ok())
                     .map(|version| (name, version))
             })
         })
@@ -634,7 +733,7 @@ impl std::fmt::Display for ExecutableProviderHints<'_> {
 // Clippy isn't happy about the difference in size between these variants, but
 // [`ToolRequirement::Package`] is the more common case and it seems annoying to box it.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum ToolRequirement {
     Python {
         executable: String,
@@ -667,7 +766,6 @@ impl std::fmt::Display for ToolRequirement {
 ///
 /// If the target tool is already installed in a compatible environment, returns that
 /// [`PythonEnvironment`]. Otherwise, gets or creates a [`CachedEnvironment`].
-#[allow(clippy::fn_params_excessive_bools)]
 async fn get_or_create_environment(
     request: &ToolRequest<'_>,
     with: &[RequirementsSource],
@@ -676,64 +774,56 @@ async fn get_or_create_environment(
     build_constraints: &[RequirementsSource],
     show_resolution: bool,
     python: Option<&str>,
+    python_platform: Option<TargetTriple>,
     install_mirrors: PythonInstallMirrors,
     options: ResolverInstallerOptions,
     settings: &ResolverInstallerSettings,
-    network_settings: &NetworkSettings,
+    client_builder: &BaseClientBuilder<'_>,
     isolated: bool,
+    lfs: GitLfsSetting,
     python_preference: PythonPreference,
     python_downloads: PythonDownloads,
     installer_metadata: bool,
-    concurrency: Concurrency,
+    concurrency: &Concurrency,
     cache: &Cache,
+    workspace_cache: &WorkspaceCache,
     printer: Printer,
     preview: Preview,
 ) -> Result<(ToolRequirement, PythonEnvironment), ProjectError> {
-    let client_builder = BaseClientBuilder::new()
-        .retries_from_env()?
-        .connectivity(network_settings.connectivity)
-        .native_tls(network_settings.native_tls)
-        .allow_insecure_host(network_settings.allow_insecure_host.clone());
-
     let reporter = PythonDownloadReporter::single(printer);
 
-    // Figure out what Python we're targeting, either explicitly like `uvx python@3`, or via the
-    // -p/--python flag.
-    let python_request = match request {
-        ToolRequest::Python {
-            request: tool_python_request,
-            ..
-        } => {
-            match python {
-                None => Some(tool_python_request.clone()),
+    // Determine explicit Python version requests
+    let explicit_python_request = python.map(PythonRequest::parse);
+    let tool_python_request = match request {
+        ToolRequest::Python { request, .. } => Some(request.clone()),
+        ToolRequest::Package { .. } => None,
+    };
 
-                // The user is both invoking a python interpreter directly and also supplying the
-                // -p/--python flag. Cases like `uvx -p pypy python` are allowed, for two reasons:
-                // 1) Previously this was the only way to invoke e.g. PyPy via `uvx`, and it's nice
-                // to remain compatible with that. 2) A script might define an alias like `uvx
-                // --python $MY_PYTHON ...`, and it's nice to be able to run the interpreter
-                // directly while sticking to that alias.
-                //
-                // However, we want to error out if we see conflicting or redundant versions like
-                // `uvx -p python38 python39`.
-                //
-                // Note that a command like `uvx default` doesn't bring us here. ToolRequest::parse
-                // returns ToolRequest::Package rather than ToolRequest::Python in that case. See
-                // PythonRequest::try_from_tool_name.
-                Some(python_flag) => {
-                    if tool_python_request != &PythonRequest::Default {
-                        return Err(anyhow::anyhow!(
-                            "Received multiple Python version requests: `{}` and `{}`",
-                            python_flag.to_string().cyan(),
-                            tool_python_request.to_canonical_string().cyan()
-                        )
-                        .into());
-                    }
-                    Some(PythonRequest::parse(python_flag))
-                }
-            }
+    // Resolve Python request with version file lookup when no explicit request
+    let python_request = match (explicit_python_request, tool_python_request) {
+        // e.g., `uvx --python 3.10 python3.12`
+        (Some(explicit), Some(tool_request)) if tool_request != PythonRequest::Default => {
+            // Conflict: both --python flag and versioned tool name
+            return Err(anyhow::anyhow!(
+                "Received multiple Python version requests: `{}` and `{}`",
+                explicit.to_canonical_string().cyan(),
+                tool_request.to_canonical_string().cyan()
+            )
+            .into());
         }
-        ToolRequest::Package { .. } => python.map(PythonRequest::parse),
+        // e.g, `uvx --python 3.10 ...`
+        (Some(explicit), _) => Some(explicit),
+        // e.g., `uvx python` or `uvx <tool>`
+        (None, Some(PythonRequest::Default) | None) => PythonVersionFile::discover(
+            &*CWD,
+            &VersionFileDiscoveryOptions::default()
+                .with_no_config(false)
+                .with_no_local(true),
+        )
+        .await?
+        .and_then(PythonVersionFile::into_version),
+        // e.g., `uvx python3.12`
+        (None, Some(tool_request)) => Some(tool_request),
     };
 
     // Discover an interpreter.
@@ -742,7 +832,7 @@ async fn get_or_create_environment(
         EnvironmentPreference::OnlySystem,
         python_preference,
         python_downloads,
-        &client_builder,
+        client_builder,
         cache,
         Some(&reporter),
         install_mirrors.python_install_mirror.as_deref(),
@@ -755,7 +845,6 @@ async fn get_or_create_environment(
 
     // Initialize any shared state.
     let state = PlatformState::default();
-    let workspace_cache = WorkspaceCache::default();
 
     let from = match request {
         ToolRequest::Python {
@@ -792,13 +881,14 @@ async fn get_or_create_environment(
                         vec![spec],
                         &interpreter,
                         settings,
-                        network_settings,
+                        client_builder,
                         &state,
                         concurrency,
                         cache,
-                        &workspace_cache,
+                        workspace_cache,
                         printer,
                         preview,
+                        lfs,
                     )
                     .await?
                     .pop()
@@ -866,13 +956,76 @@ async fn get_or_create_environment(
         }
     };
 
+    // For `@latest`, fetch the latest version and create a constraint.
+    let latest = if let ToolRequest::Package {
+        target: Target::Latest(_, name, _),
+        ..
+    } = &request
+    {
+        // Build the registry client to fetch the latest version.
+        let client = RegistryClientBuilder::new(
+            client_builder
+                .clone()
+                .keyring(settings.resolver.keyring_provider),
+            cache.clone(),
+        )
+        .index_locations(settings.resolver.index_locations.clone())
+        .index_strategy(settings.resolver.index_strategy)
+        .markers(interpreter.markers())
+        .platform(interpreter.platform())
+        .build()?;
+
+        // Initialize the capabilities.
+        let capabilities = IndexCapabilities::default();
+        let download_concurrency = concurrency.downloads_semaphore.clone();
+
+        // Initialize the client to fetch the latest version.
+        let latest_client = LatestClient {
+            client: &client,
+            capabilities: &capabilities,
+            prerelease: settings.resolver.prerelease,
+            exclude_newer: &settings.resolver.exclude_newer,
+            index_locations: &settings.resolver.index_locations,
+            tags: None,
+            requires_python: None,
+        };
+
+        // Fetch the latest version.
+        if let Some(dist_filename) = latest_client
+            .find_latest(name, None, &download_concurrency)
+            .await?
+        {
+            let version = dist_filename.version().clone();
+            debug!("Resolved `{name}@latest` to `{name}=={version}`");
+
+            // The constraint pins the version during resolution to prevent backtracking.
+            Some(Requirement {
+                name: name.clone(),
+                extras: vec![].into_boxed_slice(),
+                groups: Box::new([]),
+                marker: MarkerTree::default(),
+                source: RequirementSource::Registry {
+                    specifier: VersionSpecifiers::from(VersionSpecifier::equals_version(version)),
+                    index: None,
+                    conflict: None,
+                },
+                origin: None,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Read the `--with` requirements.
     let spec = RequirementsSpecification::from_sources(
         with,
         constraints,
         overrides,
+        &[],
         None,
-        &client_builder,
+        client_builder,
     )
     .await?;
 
@@ -888,13 +1041,14 @@ async fn get_or_create_environment(
                 spec.requirements.clone(),
                 &interpreter,
                 settings,
-                network_settings,
+                client_builder,
                 &state,
                 concurrency,
                 cache,
-                &workspace_cache,
+                workspace_cache,
                 printer,
                 preview,
+                lfs,
             )
             .await?,
         );
@@ -914,13 +1068,14 @@ async fn get_or_create_environment(
         spec.overrides.clone(),
         &interpreter,
         settings,
-        network_settings,
+        client_builder,
         &state,
         concurrency,
         cache,
-        &workspace_cache,
+        workspace_cache,
         printer,
         preview,
+        lfs,
     )
     .await?;
 
@@ -934,7 +1089,7 @@ async fn get_or_create_environment(
                 .get_environment(&requirement.name, cache)?
                 .filter(|environment| {
                     python_request.as_ref().is_none_or(|python_request| {
-                        python_request.satisfied(environment.interpreter(), cache)
+                        python_request.satisfied(environment.environment().interpreter(), cache)
                     })
                 });
 
@@ -964,14 +1119,21 @@ async fn get_or_create_environment(
                     )
                     .into_inner();
 
+                    // Determine the markers and tags to use for the resolution.
+                    let markers =
+                        pip::resolution_markers(None, python_platform.as_ref(), &interpreter);
+                    let tags = pip::resolution_tags(None, python_platform.as_ref(), &interpreter)?;
+
                     // Check if the installed packages meet the requirements.
-                    let site_packages = SitePackages::from_environment(&environment)?;
+                    let site_packages = SitePackages::from_environment(environment.environment())?;
                     if matches!(
                         site_packages.satisfies_requirements(
                             requirements.iter(),
-                            constraints.iter(),
+                            constraints.iter().chain(latest.iter()),
                             overrides.iter(),
-                            &interpreter.resolver_marker_environment(),
+                            InstallationStrategy::Permissive,
+                            &markers,
+                            &tags,
                             config_setting,
                             config_settings_package,
                             &extra_build_requires,
@@ -980,7 +1142,7 @@ async fn get_or_create_environment(
                         Ok(SatisfiesResult::Fresh { .. })
                     ) {
                         debug!("Using existing tool `{}`", requirement.name);
-                        return Ok((from, environment));
+                        return Ok((from, environment.into_environment()));
                     }
                 }
             }
@@ -995,6 +1157,7 @@ async fn get_or_create_environment(
             .collect(),
         constraints: constraints
             .into_iter()
+            .chain(latest)
             .map(NameRequirementSpecification::from)
             .collect(),
         overrides: overrides
@@ -1006,7 +1169,7 @@ async fn get_or_create_environment(
 
     // Read the `--build-constraints` requirements.
     let build_constraints = Constraints::from_requirements(
-        operations::read_constraints(build_constraints, &client_builder)
+        operations::read_constraints(build_constraints, client_builder)
             .await?
             .into_iter()
             .map(|constraint| constraint.requirement),
@@ -1019,8 +1182,9 @@ async fn get_or_create_environment(
         spec.clone(),
         build_constraints.clone(),
         &interpreter,
+        python_platform.as_ref(),
         settings,
-        network_settings,
+        client_builder,
         &state,
         if show_resolution {
             Box::new(DefaultResolveLogger)
@@ -1035,6 +1199,7 @@ async fn get_or_create_environment(
         installer_metadata,
         concurrency,
         cache,
+        workspace_cache,
         printer,
         preview,
     )
@@ -1054,7 +1219,7 @@ async fn get_or_create_environment(
                     &interpreter,
                     python_request.as_ref(),
                     &err,
-                    &client_builder,
+                    client_builder,
                     &reporter,
                     &install_mirrors,
                     python_preference,
@@ -1078,8 +1243,9 @@ async fn get_or_create_environment(
                     spec,
                     build_constraints,
                     &interpreter,
+                    python_platform.as_ref(),
                     settings,
-                    network_settings,
+                    client_builder,
                     &state,
                     if show_resolution {
                         Box::new(DefaultResolveLogger)
@@ -1094,6 +1260,7 @@ async fn get_or_create_environment(
                     installer_metadata,
                     concurrency,
                     cache,
+                    workspace_cache,
                     printer,
                     preview,
                 )
@@ -1104,4 +1271,64 @@ async fn get_or_create_environment(
     };
 
     Ok((from, environment.into()))
+}
+
+/// A Python script was passed to `uvx` / `--from`, which doesn't support scripts.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ToolRunScriptError {
+    /// Script path passed to `--from`.
+    #[error("It looks like you provided a Python script to `--from`, which is not supported")]
+    FromScript {
+        package_name: PackageName,
+        target: String,
+        invocation: ToolRunCommand,
+    },
+
+    /// Existing script path passed as the target of `uvx`.
+    #[error(
+        "It looks like you tried to run a Python script at `{path}`, which is not supported by `{invocation}`"
+    )]
+    TargetScriptExists {
+        path: PathBuf,
+        invocation: ToolRunCommand,
+    },
+
+    /// Non-existing script path passed as the target of `uvx`.
+    #[error(
+        "It looks like you provided a Python script to run, which is not supported by `{invocation}`"
+    )]
+    TargetScriptMissing {
+        package_name: PackageName,
+        target: String,
+        invocation: ToolRunCommand,
+    },
+}
+
+impl uv_errors::Hint for ToolRunScriptError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        uv_errors::Hints::from(match self {
+            Self::FromScript {
+                package_name,
+                target,
+                invocation,
+            } => format!(
+                "If you meant to run a command from the `{}` package, use the normalized package name instead to disambiguate, e.g., `{}`",
+                package_name.cyan(),
+                format!("{invocation} --from {} {target}", package_name.cyan()).green(),
+            ),
+            Self::TargetScriptExists { path, .. } => format!(
+                "Use `{}` instead",
+                format!("uv run {}", path.display()).green(),
+            ),
+            Self::TargetScriptMissing {
+                package_name,
+                target,
+                invocation,
+            } => format!(
+                "We did not find a script at the requested path. If you meant to run a command from the `{}` package, pass the normalized package name to `--from` to disambiguate, e.g., `{}`",
+                package_name.cyan(),
+                format!("{invocation} --from {package_name} {target}").green(),
+            ),
+        })
+    }
 }

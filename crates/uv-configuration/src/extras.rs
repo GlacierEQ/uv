@@ -76,7 +76,6 @@ impl ExtrasSpecification {
     }
 
     /// Create from raw CLI args
-    #[allow(clippy::fn_params_excessive_bools)]
     pub fn from_args(
         extra: Vec<ExtraName>,
         no_extra: Vec<ExtraName>,
@@ -148,11 +147,6 @@ impl ExtrasSpecificationInner {
     pub fn contains(&self, extra: &ExtraName) -> bool {
         // exclude always trumps include
         !self.exclude.contains(extra) && self.include.contains(extra)
-    }
-
-    /// Iterate over all extras that we think should exist.
-    pub fn desugarred_names(&self) -> impl Iterator<Item = &ExtraName> {
-        self.include.names().chain(&self.exclude)
     }
 
     /// Returns an iterator over all extras that are included in the specification,

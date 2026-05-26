@@ -1,23 +1,23 @@
 [package]
 name = "uv-tool"
-version = "0.0.1"
+version = "0.0.49"
+description = "This is an internal component crate of uv"
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
-documentation = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 
 [lib]
 doctest = false
+test = false
 
 [lints]
 workspace = true
 
 [dependencies]
 uv-cache = { workspace = true }
-uv-configuration = { workspace = true }
 uv-dirs = { workspace = true }
 uv-distribution-types = { workspace = true }
 uv-fs = { workspace = true }
@@ -34,6 +34,7 @@ uv-static = { workspace = true }
 uv-virtualenv = { workspace = true }
 
 fs-err = { workspace = true }
+owo-colors = { workspace = true }
 pathdiff = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

@@ -15,21 +15,21 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use glob::Pattern;
-use owo_colors::OwoColorize;
 use rustc_hash::{FxBuildHasher, FxHashSet};
-use serde::de::{IntoDeserializer, SeqAccess};
+use serde::de::SeqAccess;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
-
+use tracing::instrument;
 use uv_build_backend::BuildBackendSettings;
-use uv_distribution_types::{ExtraBuildVariables, Index, IndexName, RequirementSource};
+use uv_configuration::GitLfsSetting;
+use uv_distribution_types::{Index, IndexName, RequirementSource};
 use uv_fs::{PortablePathBuf, relative_to};
 use uv_git_types::GitReference;
 use uv_macros::OptionsMetadata;
 use uv_normalize::{DefaultGroups, ExtraName, GroupName, PackageName};
 use uv_options_metadata::{OptionSet, OptionsMetadata, Visit};
 use uv_pep440::{Version, VersionSpecifiers};
-use uv_pep508::{MarkerTree, VersionOrUrl};
+use uv_pep508::MarkerTree;
 use uv_pypi_types::{
     Conflicts, DependencyGroups, SchemaConflicts, SupportedEnvironments, VerbatimParsedUrl,
 };
@@ -38,9 +38,13 @@ use uv_redacted::DisplaySafeUrl;
 #[derive(Error, Debug)]
 pub enum PyprojectTomlError {
     #[error(transparent)]
-    TomlSyntax(#[from] toml_edit::TomlError),
-    #[error(transparent)]
-    TomlSchema(#[from] toml_edit::de::Error),
+    Toml(#[from] toml::de::Error),
+    #[error("Failed to parse `tool.uv.sources`")]
+    Source(
+        #[from]
+        #[source]
+        SourceError,
+    ),
     #[error(
         "`pyproject.toml` is using the `[project]` table, but the required `project.name` field is not set"
     )]
@@ -117,16 +121,32 @@ pub struct PyProjectToml {
 
     /// Used to determine whether a `build-system` section is present.
     #[serde(default, skip_serializing)]
-    pub build_system: Option<serde::de::IgnoredAny>,
+    pub(crate) build_system: Option<serde::de::IgnoredAny>,
 }
 
 impl PyProjectToml {
     /// Parse a `PyProjectToml` from a raw TOML string.
-    pub fn from_string(raw: String) -> Result<Self, PyprojectTomlError> {
-        let pyproject =
-            toml_edit::Document::from_str(&raw).map_err(PyprojectTomlError::TomlSyntax)?;
-        let pyproject = Self::deserialize(pyproject.into_deserializer())
-            .map_err(PyprojectTomlError::TomlSchema)?;
+    #[instrument("toml::from_str workspace", skip_all, fields(path = %_path.as_ref().display()))]
+    pub fn from_string(raw: String, _path: impl AsRef<Path>) -> Result<Self, PyprojectTomlError> {
+        let sources_wire =
+            toml::from_str::<PyProjectTomlSourcesWire>(&raw).map_err(PyprojectTomlError::Toml)?;
+        let sources = sources_wire
+            .tool
+            .and_then(|tool| tool.uv)
+            .and_then(|uv| uv.sources)
+            .map(ToolUvSources::try_from)
+            .transpose()?;
+
+        let mut pyproject: Self = toml::from_str(&raw).map_err(PyprojectTomlError::Toml)?;
+        if let Some(sources) = sources {
+            let tool_uv = pyproject
+                .tool
+                .as_mut()
+                .and_then(|tool| tool.uv.as_mut())
+                .expect("tool.uv must exist when tool.uv.sources is present");
+            tool_uv.sources = Some(sources);
+        }
+
         Ok(Self { raw, ..pyproject })
     }
 
@@ -275,10 +295,11 @@ pub struct Tool {
     pub uv: Option<ToolUv>,
 }
 
-/// Validates that index names in the `tool.uv.index` field are unique.
+/// Validates the `tool.uv.index` field.
 ///
-/// This custom deserializer function checks for duplicate index names
-/// and returns an error if any duplicates are found.
+/// This custom deserializer function checks for:
+/// - Duplicate index names
+/// - Multiple indexes marked as default
 fn deserialize_index_vec<'de, D>(deserializer: D) -> Result<Option<Vec<Index>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -286,6 +307,7 @@ where
     let indexes = Option::<Vec<Index>>::deserialize(deserializer)?;
     if let Some(indexes) = indexes.as_ref() {
         let mut seen_names = FxHashSet::with_capacity_and_hasher(indexes.len(), FxBuildHasher);
+        let mut seen_default = false;
         for index in indexes {
             if let Some(name) = index.name.as_ref() {
                 if !seen_names.insert(name) {
@@ -293,6 +315,14 @@ where
                         "duplicate index name `{name}`"
                     )));
                 }
+            }
+            if index.default {
+                if seen_default {
+                    return Err(serde::de::Error::custom(
+                        "found multiple indexes with `default = true`; only one index may be marked as default",
+                    ));
+                }
+                seen_default = true;
             }
         }
     }
@@ -323,6 +353,7 @@ pub struct ToolUv {
             pydantic = { path = "/path/to/pydantic", editable = true }
         "#
     )]
+    #[serde(default, deserialize_with = "ignore_tool_uv_sources")]
     pub sources: Option<ToolUvSources>,
 
     /// The indexes to use when resolving dependencies.
@@ -342,7 +373,7 @@ pub struct ToolUv {
     /// ```toml
     /// [[tool.uv.index]]
     /// name = "pytorch"
-    /// url = "https://download.pytorch.org/whl/cu121"
+    /// url = "https://download.pytorch.org/whl/cu130"
     /// explicit = true
     ///
     /// [tool.uv.sources]
@@ -358,7 +389,7 @@ pub struct ToolUv {
         example = r#"
             [[tool.uv.index]]
             name = "pytorch"
-            url = "https://download.pytorch.org/whl/cu121"
+            url = "https://download.pytorch.org/whl/cu130"
         "#
     )]
     #[serde(deserialize_with = "deserialize_index_vec", default)]
@@ -366,7 +397,7 @@ pub struct ToolUv {
 
     /// The workspace definition for the project, if any.
     #[option_group]
-    pub workspace: Option<ToolUvWorkspace>,
+    pub(crate) workspace: Option<ToolUvWorkspace>,
 
     /// Whether the project is managed by uv. If `false`, uv will ignore the project when
     /// `uv run` is invoked.
@@ -377,7 +408,7 @@ pub struct ToolUv {
             managed = false
         "#
     )]
-    pub managed: Option<bool>,
+    pub(crate) managed: Option<bool>,
 
     /// Whether the project should be considered a Python package, or a non-package ("virtual")
     /// project.
@@ -396,7 +427,7 @@ pub struct ToolUv {
             package = false
         "#
     )]
-    pub package: Option<bool>,
+    pub(crate) package: Option<bool>,
 
     /// The list of `dependency-groups` to install by default.
     ///
@@ -426,36 +457,7 @@ pub struct ToolUv {
             my-group = {requires-python = ">=3.12"}
         "#
     )]
-    pub dependency_groups: Option<ToolUvDependencyGroups>,
-
-    /// Additional build dependencies for packages.
-    ///
-    /// This allows extending the PEP 517 build environment for the project's dependencies with
-    /// additional packages. This is useful for packages that assume the presence of packages, like,
-    /// `pip`, and do not declare them as build dependencies.
-    #[option(
-        default = "[]",
-        value_type = "dict",
-        example = r#"
-            [tool.uv.extra-build-dependencies]
-            pytest = ["pip"]
-        "#
-    )]
-    pub extra_build_dependencies: Option<ExtraBuildDependencies>,
-
-    /// Extra environment variables to set when building certain packages.
-    ///
-    /// Environment variables will be added to the environment when building the
-    /// specified packages.
-    #[option(
-        default = r#"{}"#,
-        value_type = r#"dict[str, dict[str, str]]"#,
-        example = r#"
-            [tool.uv.extra-build-variables]
-            flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
-        "#
-    )]
-    pub extra_build_variables: Option<ExtraBuildVariables>,
+    pub(crate) dependency_groups: Option<ToolUvDependencyGroups>,
 
     /// The project's development dependencies.
     ///
@@ -517,6 +519,37 @@ pub struct ToolUv {
         "#
     )]
     pub override_dependencies: Option<Vec<uv_pep508::Requirement<VerbatimParsedUrl>>>,
+
+    /// Dependencies to exclude when resolving the project's dependencies.
+    ///
+    /// Excludes are used to prevent a package from being selected during resolution,
+    /// regardless of whether it's requested by any other package. When a package is excluded,
+    /// it will be omitted from the dependency list entirely.
+    ///
+    /// Including a package as an exclusion will prevent it from being installed, even if
+    /// it's requested by transitive dependencies. This can be useful for removing optional
+    /// dependencies or working around packages with broken dependencies.
+    ///
+    /// !!! note
+    ///     In `uv lock`, `uv sync`, and `uv run`, uv will only read `exclude-dependencies` from
+    ///     the `pyproject.toml` at the workspace root, and will ignore any declarations in other
+    ///     workspace members or `uv.toml` files.
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(
+            with = "Option<Vec<String>>",
+            description = "Package names to exclude, e.g., `werkzeug`, `numpy`."
+        )
+    )]
+    #[option(
+        default = "[]",
+        value_type = "list[str]",
+        example = r#"
+            # Exclude Werkzeug from being installed, even if transitive dependencies request it.
+            exclude-dependencies = ["werkzeug"]
+        "#
+    )]
+    pub exclude_dependencies: Option<Vec<PackageName>>,
 
     /// Constraints to apply when resolving the project's dependencies.
     ///
@@ -603,7 +636,7 @@ pub struct ToolUv {
             environments = ["sys_platform == 'darwin'"]
         "#
     )]
-    pub environments: Option<SupportedEnvironments>,
+    pub(crate) environments: Option<SupportedEnvironments>,
 
     /// A list of required platforms, for packages that lack source distributions.
     ///
@@ -635,14 +668,18 @@ pub struct ToolUv {
         default = "[]",
         value_type = "str | list[str]",
         example = r#"
-            # Require that the package is available for macOS ARM and x86 (Intel).
+            # Require that the package is available on the following platforms:
             required-environments = [
+                # macOS on Apple Silicon (ARM)
                 "sys_platform == 'darwin' and platform_machine == 'arm64'",
-                "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+                # Linux on x86_64 (Intel/AMD)
+                "sys_platform == 'linux' and platform_machine == 'x86_64'",
+                # Windows on x86_64 (Intel/AMD)
+                "sys_platform == 'win32' and platform_machine == 'AMD64'",
             ]
         "#
     )]
-    pub required_environments: Option<SupportedEnvironments>,
+    pub(crate) required_environments: Option<SupportedEnvironments>,
 
     /// Declare collections of extras or dependency groups that are conflicting
     /// (i.e., mutually exclusive).
@@ -686,7 +723,7 @@ pub struct ToolUv {
             ]
         "#
     )]
-    pub conflicts: Option<SchemaConflicts>,
+    pub(crate) conflicts: Option<SchemaConflicts>,
 
     // Only exists on this type for schema and docs generation, the build backend settings are
     // never merged in a workspace and read separately by the backend code.
@@ -695,13 +732,41 @@ pub struct ToolUv {
     /// Note that those settings only apply when using the `uv_build` backend, other build backends
     /// (such as hatchling) have their own configuration.
     #[option_group]
-    pub build_backend: Option<BuildBackendSettingsSchema>,
+    pub(crate) build_backend: Option<BuildBackendSettingsSchema>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Serialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ToolUvSources(BTreeMap<PackageName, Sources>);
+
+fn ignore_tool_uv_sources<'de, D>(deserializer: D) -> Result<Option<ToolUvSources>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+struct PyProjectTomlSourcesWire {
+    tool: Option<ToolSourcesWire>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ToolSourcesWire {
+    uv: Option<ToolUvSourcesOnlyWire>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+struct ToolUvSourcesOnlyWire {
+    sources: Option<ToolUvSourcesWire>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct ToolUvSourcesWire(BTreeMap<PackageName, SourcesWire>);
 
 impl ToolUvSources {
     /// Returns the underlying `BTreeMap` of package names to sources.
@@ -713,6 +778,31 @@ impl ToolUvSources {
     #[must_use]
     pub fn into_inner(self) -> BTreeMap<PackageName, Sources> {
         self.0
+    }
+}
+
+impl TryFrom<ToolUvSourcesWire> for ToolUvSources {
+    type Error = SourceError;
+
+    fn try_from(wire: ToolUvSourcesWire) -> Result<Self, Self::Error> {
+        wire.0
+            .into_iter()
+            .map(|(name, sources)| Sources::try_from(sources).map(|sources| (name, sources)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(Self)
+    }
+}
+
+/// Ensure that all keys in the TOML table are unique.
+impl<'de> serde::de::Deserialize<'de> for ToolUvSourcesWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_unique_map(deserializer, |key: &PackageName| {
+            format!("duplicate sources for package `{key}`")
+        })
+        .map(ToolUvSourcesWire)
     }
 }
 
@@ -732,18 +822,12 @@ impl<'de> serde::de::Deserialize<'de> for ToolUvSources {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Serialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct ToolUvDependencyGroups(BTreeMap<GroupName, DependencyGroupSettings>);
+pub(crate) struct ToolUvDependencyGroups(BTreeMap<GroupName, DependencyGroupSettings>);
 
 impl ToolUvDependencyGroups {
     /// Returns the underlying `BTreeMap` of group names to settings.
-    pub fn inner(&self) -> &BTreeMap<GroupName, DependencyGroupSettings> {
+    pub(crate) fn inner(&self) -> &BTreeMap<GroupName, DependencyGroupSettings> {
         &self.0
-    }
-
-    /// Convert the [`ToolUvDependencyGroups`] into its inner `BTreeMap`.
-    #[must_use]
-    pub fn into_inner(self) -> BTreeMap<GroupName, DependencyGroupSettings> {
-        self.0
     }
 }
 
@@ -764,16 +848,16 @@ impl<'de> serde::de::Deserialize<'de> for ToolUvDependencyGroups {
 #[cfg_attr(test, derive(Serialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
-pub struct DependencyGroupSettings {
+pub(crate) struct DependencyGroupSettings {
     /// Version of python to require when installing this group
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
-    pub requires_python: Option<VersionSpecifiers>,
+    pub(crate) requires_python: Option<VersionSpecifiers>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, rename_all = "kebab-case")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub enum ExtraBuildDependencyWire {
+enum ExtraBuildDependencyWire {
     Unannotated(uv_pep508::Requirement<VerbatimParsedUrl>),
     #[serde(rename_all = "kebab-case")]
     Annotated {
@@ -785,7 +869,7 @@ pub enum ExtraBuildDependencyWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
-    try_from = "ExtraBuildDependencyWire",
+    from = "ExtraBuildDependencyWire",
     into = "ExtraBuildDependencyWire"
 )]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -800,38 +884,19 @@ impl From<ExtraBuildDependency> for uv_pep508::Requirement<VerbatimParsedUrl> {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum ExtraBuildDependencyError {
-    #[error("Dependencies marked with `match-runtime = true` cannot include version specifiers")]
-    VersionSpecifiersNotAllowed,
-    #[error("Dependencies marked with `match-runtime = true` cannot include URL constraints")]
-    UrlNotAllowed,
-}
-
-impl TryFrom<ExtraBuildDependencyWire> for ExtraBuildDependency {
-    type Error = ExtraBuildDependencyError;
-
-    fn try_from(wire: ExtraBuildDependencyWire) -> Result<Self, ExtraBuildDependencyError> {
+impl From<ExtraBuildDependencyWire> for ExtraBuildDependency {
+    fn from(wire: ExtraBuildDependencyWire) -> Self {
         match wire {
-            ExtraBuildDependencyWire::Unannotated(requirement) => Ok(Self {
+            ExtraBuildDependencyWire::Unannotated(requirement) => Self {
                 requirement,
                 match_runtime: false,
-            }),
+            },
             ExtraBuildDependencyWire::Annotated {
                 requirement,
                 match_runtime,
-            } => match requirement.version_or_url {
-                // If `match-runtime = true`, reject additional constraints.
-                Some(VersionOrUrl::VersionSpecifier(..)) if match_runtime => {
-                    Err(ExtraBuildDependencyError::VersionSpecifiersNotAllowed)
-                }
-                Some(VersionOrUrl::Url(..)) if match_runtime => {
-                    Err(ExtraBuildDependencyError::UrlNotAllowed)
-                }
-                _ => Ok(Self {
-                    requirement,
-                    match_runtime,
-                }),
+            } => Self {
+                requirement,
+                match_runtime,
             },
         }
     }
@@ -898,7 +963,7 @@ impl<'de> serde::de::Deserialize<'de> for ExtraBuildDependencies {
 #[cfg_attr(test, derive(Serialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ToolUvWorkspace {
+pub(crate) struct ToolUvWorkspace {
     /// Packages to include as workspace members.
     ///
     /// Supports both globs and explicit paths.
@@ -911,7 +976,7 @@ pub struct ToolUvWorkspace {
             members = ["member1", "path/to/member2", "libs/*"]
         "#
     )]
-    pub members: Option<Vec<SerdePattern>>,
+    pub(crate) members: Option<Vec<SerdePattern>>,
     /// Packages to exclude as workspace members. If a package matches both `members` and
     /// `exclude`, it will be excluded.
     ///
@@ -925,12 +990,12 @@ pub struct ToolUvWorkspace {
             exclude = ["member1", "path/to/member2", "libs/*"]
         "#
     )]
-    pub exclude: Option<Vec<SerdePattern>>,
+    pub(crate) exclude: Option<Vec<SerdePattern>>,
 }
 
 /// (De)serialize globs as strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SerdePattern(Pattern);
+pub(crate) struct SerdePattern(Pattern);
 
 impl serde::ser::Serialize for SerdePattern {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -1025,7 +1090,6 @@ impl IntoIterator for Sources {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema), schemars(untagged))]
-#[allow(clippy::large_enum_variant)]
 enum SourcesWire {
     One(Source),
     Many(Vec<Source>),
@@ -1133,12 +1197,16 @@ pub enum Source {
     Git {
         /// The repository URL (without the `git+` prefix).
         git: DisplaySafeUrl,
-        /// The path to the directory with the `pyproject.toml`, if it's not in the archive root.
+        /// The path to the directory with the `pyproject.toml`, if it's not in the repository root.
         subdirectory: Option<PortablePathBuf>,
+        /// The path to the archive within the repository.
+        path: Option<PortablePathBuf>,
         // Only one of the three may be used; we'll validate this later and emit a custom error.
         rev: Option<String>,
         tag: Option<String>,
         branch: Option<String>,
+        /// Whether to use Git LFS when cloning the repository.
+        lfs: Option<bool>,
         #[serde(
             skip_serializing_if = "uv_pep508::marker::ser::is_empty",
             serialize_with = "uv_pep508::marker::ser::serialize",
@@ -1209,6 +1277,8 @@ pub enum Source {
         /// When set to `false`, the package will be fetched from the remote index, rather than
         /// included as a workspace package.
         workspace: bool,
+        /// Whether the package should be installed as editable. Defaults to `true`.
+        editable: Option<bool>,
         #[serde(
             skip_serializing_if = "uv_pep508::marker::ser::is_empty",
             serialize_with = "uv_pep508::marker::ser::serialize",
@@ -1235,6 +1305,7 @@ impl<'de> Deserialize<'de> for Source {
             rev: Option<String>,
             tag: Option<String>,
             branch: Option<String>,
+            lfs: Option<bool>,
             url: Option<DisplaySafeUrl>,
             path: Option<PortablePathBuf>,
             editable: Option<bool>,
@@ -1258,6 +1329,7 @@ impl<'de> Deserialize<'de> for Source {
             rev,
             tag,
             branch,
+            lfs,
             url,
             path,
             editable,
@@ -1288,11 +1360,6 @@ impl<'de> Deserialize<'de> for Source {
                     "cannot specify both `git` and `workspace`",
                 ));
             }
-            if path.is_some() {
-                return Err(serde::de::Error::custom(
-                    "cannot specify both `git` and `path`",
-                ));
-            }
             if url.is_some() {
                 return Err(serde::de::Error::custom(
                     "cannot specify both `git` and `url`",
@@ -1306,6 +1373,11 @@ impl<'de> Deserialize<'de> for Source {
             if package.is_some() {
                 return Err(serde::de::Error::custom(
                     "cannot specify both `git` and `package`",
+                ));
+            }
+            if subdirectory.is_some() && path.is_some() {
+                return Err(serde::de::Error::custom(
+                    "cannot specify both `subdirectory` and `path`",
                 ));
             }
 
@@ -1332,9 +1404,11 @@ impl<'de> Deserialize<'de> for Source {
             return Ok(Self::Git {
                 git,
                 subdirectory,
+                path,
                 rev,
                 tag,
                 branch,
+                lfs,
                 marker,
                 extra,
                 group,
@@ -1546,11 +1620,6 @@ impl<'de> Deserialize<'de> for Source {
                     "cannot specify both `workspace` and `branch`",
                 ));
             }
-            if editable.is_some() {
-                return Err(serde::de::Error::custom(
-                    "cannot specify both `workspace` and `editable`",
-                ));
-            }
             if package.is_some() {
                 return Err(serde::de::Error::custom(
                     "cannot specify both `workspace` and `package`",
@@ -1559,6 +1628,7 @@ impl<'de> Deserialize<'de> for Source {
 
             return Ok(Self::Workspace {
                 workspace,
+                editable,
                 marker,
                 extra,
                 group,
@@ -1595,19 +1665,18 @@ pub enum SourceError {
     )]
     UnusedBranch(String, String),
     #[error(
+        "`{0}` did not resolve to a Git repository, but a Git extension (`--lfs`) was provided."
+    )]
+    UnusedLfs(String),
+    #[error(
         "`{0}` did not resolve to a local directory, but the `--editable` flag was provided. Editable installs are only supported for local directories."
     )]
     UnusedEditable(String),
-    #[error(
-        "Workspace dependency `{0}` was marked as `--no-editable`, but workspace dependencies are always added in editable mode. Pass `--no-editable` to `uv sync` or `uv run` to install workspace dependencies in non-editable mode."
-    )]
-    UnusedNoEditable(String),
     #[error("Failed to resolve absolute path")]
     Absolute(#[from] std::io::Error),
     #[error("Path contains invalid characters: `{}`", _0.display())]
     NonUtf8Path(PathBuf),
-    #[error("Source markers must be disjoint, but the following markers overlap: `{0}` and `{1}`.\n\n{hint}{colon} replace `{1}` with `{2}`.", hint = "hint".bold().cyan(), colon = ":".bold()
-    )]
+    #[error("Source markers must be disjoint, but the following markers overlap: `{0}` and `{1}`.")]
     OverlappingMarkers(String, String, String),
     #[error(
         "When multiple sources are provided, each source must include a platform marker (e.g., `marker = \"sys_platform == 'linux'\"`)"
@@ -1615,6 +1684,17 @@ pub enum SourceError {
     MissingMarkers,
     #[error("Must provide at least one source")]
     EmptySources,
+}
+
+impl uv_errors::Hint for SourceError {
+    fn hints(&self) -> uv_errors::Hints<'_> {
+        match self {
+            Self::OverlappingMarkers(_, rhs, replacement) => {
+                uv_errors::Hints::from(format!("replace `{rhs}` with `{replacement}`"))
+            }
+            _ => uv_errors::Hints::none(),
+        }
+    }
 }
 
 impl Source {
@@ -1627,12 +1707,18 @@ impl Source {
         rev: Option<String>,
         tag: Option<String>,
         branch: Option<String>,
+        lfs: GitLfsSetting,
         root: &Path,
         existing_sources: Option<&BTreeMap<PackageName, Sources>>,
     ) -> Result<Option<Self>, SourceError> {
         // If the user specified a Git reference for a non-Git source, try existing Git sources before erroring.
-        if !matches!(source, RequirementSource::Git { .. })
-            && (branch.is_some() || tag.is_some() || rev.is_some())
+        if !matches!(
+            source,
+            RequirementSource::GitDirectory { .. } | RequirementSource::GitPath { .. }
+        ) && (branch.is_some()
+            || tag.is_some()
+            || rev.is_some()
+            || matches!(lfs, GitLfsSetting::Enabled { .. }))
         {
             if let Some(sources) = existing_sources {
                 if let Some(package_sources) = sources.get(name) {
@@ -1640,6 +1726,7 @@ impl Source {
                         if let Self::Git {
                             git,
                             subdirectory,
+                            path,
                             marker,
                             extra,
                             group,
@@ -1652,7 +1739,9 @@ impl Source {
                                 rev,
                                 tag,
                                 branch,
+                                lfs: lfs.into(),
                                 marker: *marker,
+                                path: path.clone(),
                                 extra: extra.clone(),
                                 group: group.clone(),
                             }));
@@ -1669,15 +1758,13 @@ impl Source {
             if let Some(branch) = branch {
                 return Err(SourceError::UnusedBranch(name.to_string(), branch));
             }
+            if matches!(lfs, GitLfsSetting::Enabled { from_env: false }) {
+                return Err(SourceError::UnusedLfs(name.to_string()));
+            }
         }
 
-        if workspace {
-            // If a workspace source is added with `--no-editable`, error.
-            if editable == Some(false) {
-                return Err(SourceError::UnusedNoEditable(name.to_string()));
-            }
-        } else {
-            // If we resolved a non-path source, and user specified an `--editable` flag, error.
+        // If we resolved a non-path source, and user specified an `--editable` flag, error.
+        if !workspace {
             if !matches!(source, RequirementSource::Directory { .. }) {
                 if editable == Some(true) {
                     return Err(SourceError::UnusedEditable(name.to_string()));
@@ -1691,6 +1778,7 @@ impl Source {
                 RequirementSource::Registry { .. } | RequirementSource::Directory { .. } => {
                     Ok(Some(Self::Workspace {
                         workspace: true,
+                        editable,
                         marker: MarkerTree::TRUE,
                         extra: None,
                         group: None,
@@ -1699,7 +1787,10 @@ impl Source {
                 RequirementSource::Url { .. } => {
                     Err(SourceError::WorkspacePackageUrl(name.to_string()))
                 }
-                RequirementSource::Git { .. } => {
+                RequirementSource::GitDirectory { .. } => {
+                    Err(SourceError::WorkspacePackageGit(name.to_string()))
+                }
+                RequirementSource::GitPath { .. } => {
                     Err(SourceError::WorkspacePackageGit(name.to_string()))
                 }
                 RequirementSource::Path { .. } => {
@@ -1724,9 +1815,25 @@ impl Source {
                     return Ok(None);
                 }
             }
-            RequirementSource::Path { install_path, .. }
-            | RequirementSource::Directory { install_path, .. } => Self::Path {
-                editable,
+            RequirementSource::Path { install_path, .. } => Self::Path {
+                editable: None,
+                package: None,
+                path: PortablePathBuf::from(
+                    relative_to(&install_path, root)
+                        .or_else(|_| std::path::absolute(&install_path))
+                        .map_err(SourceError::Absolute)?
+                        .into_boxed_path(),
+                ),
+                marker: MarkerTree::TRUE,
+                extra: None,
+                group: None,
+            },
+            RequirementSource::Directory {
+                install_path,
+                editable: is_editable,
+                ..
+            } => Self::Path {
+                editable: editable.or(is_editable),
                 package: None,
                 path: PortablePathBuf::from(
                     relative_to(&install_path, root)
@@ -1749,7 +1856,7 @@ impl Source {
                 extra: None,
                 group: None,
             },
-            RequirementSource::Git {
+            RequirementSource::GitDirectory {
                 git, subdirectory, ..
             } => {
                 if rev.is_none() && tag.is_none() && branch.is_none() {
@@ -1765,8 +1872,10 @@ impl Source {
                         rev: rev.cloned(),
                         tag,
                         branch,
-                        git: git.repository().clone(),
+                        lfs: lfs.into(),
+                        git: git.url().clone(),
                         subdirectory: subdirectory.map(PortablePathBuf::from),
+                        path: None,
                         marker: MarkerTree::TRUE,
                         extra: None,
                         group: None,
@@ -1776,8 +1885,49 @@ impl Source {
                         rev,
                         tag,
                         branch,
-                        git: git.repository().clone(),
+                        lfs: lfs.into(),
+                        git: git.url().clone(),
                         subdirectory: subdirectory.map(PortablePathBuf::from),
+                        path: None,
+                        marker: MarkerTree::TRUE,
+                        extra: None,
+                        group: None,
+                    }
+                }
+            }
+            RequirementSource::GitPath {
+                git, install_path, ..
+            } => {
+                if rev.is_none() && tag.is_none() && branch.is_none() {
+                    let rev = match git.reference() {
+                        GitReference::Branch(rev) => Some(rev),
+                        GitReference::Tag(rev) => Some(rev),
+                        GitReference::BranchOrTag(rev) => Some(rev),
+                        GitReference::BranchOrTagOrCommit(rev) => Some(rev),
+                        GitReference::NamedRef(rev) => Some(rev),
+                        GitReference::DefaultBranch => None,
+                    };
+                    Self::Git {
+                        rev: rev.cloned(),
+                        tag,
+                        branch,
+                        lfs: lfs.into(),
+                        git: git.url().clone(),
+                        subdirectory: None,
+                        path: Some(PortablePathBuf::from(install_path.as_path())),
+                        marker: MarkerTree::TRUE,
+                        extra: None,
+                        group: None,
+                    }
+                } else {
+                    Self::Git {
+                        rev,
+                        tag,
+                        branch,
+                        lfs: lfs.into(),
+                        git: git.url().clone(),
+                        subdirectory: None,
+                        path: Some(PortablePathBuf::from(install_path.as_path())),
                         marker: MarkerTree::TRUE,
                         extra: None,
                         group: None,
@@ -1836,9 +1986,23 @@ pub enum DependencyType {
     Group(GroupName),
 }
 
+impl DependencyType {
+    /// Return the TOML table name(s) for this dependency type.
+    pub fn toml_table_name(&self) -> String {
+        match self {
+            Self::Production => "`project.dependencies`".to_string(),
+            Self::Dev => {
+                "`tool.uv.dev-dependencies` or `tool.uv.dependency-groups.dev`".to_string()
+            }
+            Self::Optional(extra) => format!("`project.optional-dependencies.{extra}`"),
+            Self::Group(group) => format!("`dependency-groups.{group}`"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Serialize))]
-pub struct BuildBackendSettingsSchema;
+pub(crate) struct BuildBackendSettingsSchema;
 
 impl<'de> Deserialize<'de> for BuildBackendSettingsSchema {
     fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>

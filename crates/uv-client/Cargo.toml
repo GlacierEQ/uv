@@ -1,7 +1,16 @@
 [package]
 name = "uv-client"
-version = "0.0.1"
+version = "0.0.49"
+description = "This is an internal component crate of uv"
 edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+test-pypi = []
 
 [lib]
 doctest = false
@@ -17,11 +26,13 @@ uv-configuration = { workspace = true }
 uv-distribution-filename = { workspace = true }
 uv-distribution-types = { workspace = true }
 uv-fs = { workspace = true, features = ["tokio"] }
+uv-git = { workspace = true }
 uv-metadata = { workspace = true }
 uv-normalize = { workspace = true }
 uv-pep440 = { workspace = true }
 uv-pep508 = { workspace = true }
 uv-platform-tags = { workspace = true }
+uv-preview = { workspace = true }
 uv-pypi-types = { workspace = true }
 uv-small-str = { workspace = true }
 uv-redacted = { workspace = true }
@@ -31,12 +42,14 @@ uv-version = { workspace = true }
 uv-warnings = { workspace = true }
 
 anyhow = { workspace = true }
+astral-tl = { workspace = true }
 async-trait = { workspace = true }
 async_http_range_reader = { workspace = true }
 async_zip = { workspace = true }
 bytecheck = { workspace = true }
 fs-err = { workspace = true, features = ["tokio"] }
 futures = { workspace = true }
+h2 = { workspace = true }
 html-escape = { workspace = true }
 http = { workspace = true }
 itertools = { workspace = true }
@@ -48,15 +61,19 @@ reqwest-retry = { workspace = true }
 rkyv = { workspace = true }
 rmp-serde = { workspace = true }
 rustc-hash = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { workspace = true }
 serde = { workspace = true }
+webpki = { workspace = true }
+x509-parser = { workspace = true }
 serde_json = { workspace = true }
-sys-info = { workspace = true }
+uv-platform = { workspace = true }
 thiserror = { workspace = true }
-tl = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+webpki-root-certs = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -64,5 +81,11 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 insta = { workspace = true }
+rcgen = { workspace = true }
+regex = { workspace = true }
+rustls = { workspace = true }
+temp-env = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 wiremock = { workspace = true }

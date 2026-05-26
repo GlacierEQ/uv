@@ -3,7 +3,46 @@ use std::str::FromStr;
 
 use uv_small_str::SmallString;
 
+use crate::tags::AndroidAbi;
+use crate::tags::IosMultiarch;
 use crate::{Arch, BinaryFormat};
+
+/// Opaque release-and-architecture suffix used by [`PlatformTag`] variants that preserve a native
+/// platform-specific suffix.
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+)]
+#[rkyv(derive(Debug))]
+pub struct ReleaseArch(SmallString);
+
+impl FromStr for ReleaseArch {
+    type Err = ParseReleaseArchError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            Ok(Self(SmallString::from(s)))
+        } else {
+            Err(ParseReleaseArchError)
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseArch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// A tag to represent the platform compatibility of a Python distribution.
 ///
@@ -56,23 +95,32 @@ pub enum PlatformTag {
     /// Ex) `win_ia64`
     WinIa64,
     /// Ex) `android_21_x86_64`
-    Android { api_level: u16, arch: Arch },
+    Android { api_level: u16, abi: AndroidAbi },
     /// Ex) `freebsd_12_x86_64`
-    FreeBsd { release_arch: SmallString },
+    FreeBsd { release_arch: ReleaseArch },
     /// Ex) `netbsd_9_x86_64`
-    NetBsd { release_arch: SmallString },
+    NetBsd { release_arch: ReleaseArch },
     /// Ex) `openbsd_6_x86_64`
-    OpenBsd { release_arch: SmallString },
+    OpenBsd { release_arch: ReleaseArch },
     /// Ex) `dragonfly_6_x86_64`
-    Dragonfly { release_arch: SmallString },
+    Dragonfly { release_arch: ReleaseArch },
     /// Ex) `haiku_1_x86_64`
-    Haiku { release_arch: SmallString },
+    Haiku { release_arch: ReleaseArch },
     /// Ex) `illumos_5_11_x86_64`
-    Illumos { release_arch: SmallString },
+    Illumos { release_arch: ReleaseArch },
     /// Ex) `solaris_11_4_x86_64`
-    Solaris { release_arch: SmallString },
+    Solaris { release_arch: ReleaseArch },
     /// Ex) `pyodide_2024_0_wasm32`
     Pyodide { major: u16, minor: u16 },
+    /// Ex) `ios_13_0_arm64_iphoneos` / `ios_13_0_arm64_iphonesimulator`
+    Ios {
+        major: u16,
+        minor: u16,
+        /// iOS architecture and whether it is a simulator or a real device.
+        ///
+        /// Not to be confused with the Linux mulitarch concept.
+        multiarch: IosMultiarch,
+    },
 }
 
 impl PlatformTag {
@@ -100,6 +148,7 @@ impl PlatformTag {
             Self::Illumos { .. } => Some("Illumos"),
             Self::Solaris { .. } => Some("Solaris"),
             Self::Pyodide { .. } => Some("Pyodide"),
+            Self::Ios { .. } => Some("iOS"),
         }
     }
 }
@@ -111,7 +160,7 @@ impl PlatformTag {
     }
 
     /// Returns `true` if the platform is manylinux-only.
-    pub fn is_manylinux(&self) -> bool {
+    pub(crate) fn is_manylinux(&self) -> bool {
         matches!(
             self,
             Self::Manylinux { .. }
@@ -177,9 +226,12 @@ impl PlatformTag {
             } | Self::Macos {
                 binary_format: BinaryFormat::Arm64,
                 ..
+            } | Self::Ios {
+                multiarch: IosMultiarch::Arm64Device | IosMultiarch::Arm64Simulator,
+                ..
             } | Self::WinArm64
                 | Self::Android {
-                    arch: Arch::Aarch64,
+                    abi: AndroidAbi::Arm64V8a,
                     ..
                 }
         )
@@ -209,6 +261,9 @@ impl PlatformTag {
                 ..
             } | Self::Macos {
                 binary_format: BinaryFormat::X86_64,
+                ..
+            } | Self::Ios {
+                multiarch: IosMultiarch::X86_64Simulator,
                 ..
             } | Self::WinAmd64
         )
@@ -242,6 +297,140 @@ impl PlatformTag {
             } | Self::Win32
         )
     }
+
+    /// Returns `true` if the tag is only applicable on ppc64le platforms.
+    pub fn is_ppc64le(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::Powerpc64Le,
+                ..
+            } | Self::Manylinux2014 {
+                arch: Arch::Powerpc64Le,
+                ..
+            } | Self::Linux {
+                arch: Arch::Powerpc64Le,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::Powerpc64Le,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on ppc64 platforms.
+    pub fn is_ppc64(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::Powerpc64,
+                ..
+            } | Self::Manylinux2014 {
+                arch: Arch::Powerpc64,
+                ..
+            } | Self::Linux {
+                arch: Arch::Powerpc64,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::Powerpc64,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on s390x platforms.
+    pub fn is_s390x(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::S390X,
+                ..
+            } | Self::Manylinux2014 {
+                arch: Arch::S390X,
+                ..
+            } | Self::Linux {
+                arch: Arch::S390X,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::S390X,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on riscv64 platforms.
+    pub fn is_riscv64(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::Riscv64,
+                ..
+            } | Self::Linux {
+                arch: Arch::Riscv64,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::Riscv64,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on loongarch64 platforms.
+    pub fn is_loongarch64(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::LoongArch64,
+                ..
+            } | Self::Linux {
+                arch: Arch::LoongArch64,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::LoongArch64,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on armv7l platforms.
+    pub fn is_armv7l(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::Armv7L,
+                ..
+            } | Self::Manylinux2014 {
+                arch: Arch::Armv7L,
+                ..
+            } | Self::Linux {
+                arch: Arch::Armv7L,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::Armv7L,
+                ..
+            }
+        )
+    }
+
+    /// Returns `true` if the tag is only applicable on armv6l platforms.
+    pub fn is_armv6l(&self) -> bool {
+        matches!(
+            self,
+            Self::Manylinux {
+                arch: Arch::Armv6L,
+                ..
+            } | Self::Manylinux2014 {
+                arch: Arch::Armv6L,
+                ..
+            } | Self::Linux {
+                arch: Arch::Armv6L,
+                ..
+            } | Self::Musllinux {
+                arch: Arch::Armv6L,
+                ..
+            }
+        )
+    }
 }
 
 impl std::fmt::Display for PlatformTag {
@@ -267,7 +456,7 @@ impl std::fmt::Display for PlatformTag {
             Self::WinAmd64 => write!(f, "win_amd64"),
             Self::WinArm64 => write!(f, "win_arm64"),
             Self::WinIa64 => write!(f, "win_ia64"),
-            Self::Android { api_level, arch } => write!(f, "android_{api_level}_{arch}"),
+            Self::Android { api_level, abi } => write!(f, "android_{api_level}_{abi}"),
             Self::FreeBsd { release_arch } => write!(f, "freebsd_{release_arch}"),
             Self::NetBsd { release_arch } => write!(f, "netbsd_{release_arch}"),
             Self::OpenBsd { release_arch } => write!(f, "openbsd_{release_arch}"),
@@ -276,6 +465,11 @@ impl std::fmt::Display for PlatformTag {
             Self::Illumos { release_arch } => write!(f, "illumos_{release_arch}"),
             Self::Solaris { release_arch } => write!(f, "solaris_{release_arch}_64bit"),
             Self::Pyodide { major, minor } => write!(f, "pyodide_{major}_{minor}_wasm32"),
+            Self::Ios {
+                major,
+                minor,
+                multiarch,
+            } => write!(f, "ios_{major}_{minor}_{multiarch}"),
         }
     }
 }
@@ -489,7 +683,7 @@ impl FromStr for PlatformTag {
         }
 
         if let Some(rest) = s.strip_prefix("android_") {
-            // Ex) android_21_arm64
+            // Ex) android_21_arm64_v8a
             let underscore = memchr::memchr(b'_', rest.as_bytes()).ok_or_else(|| {
                 ParsePlatformTagError::InvalidFormat {
                     platform: "android",
@@ -505,22 +699,22 @@ impl FromStr for PlatformTag {
                         tag: s.to_string(),
                     })?;
 
-            let arch_str = &rest[underscore + 1..];
-            if arch_str.is_empty() {
+            let abi_str = &rest[underscore + 1..];
+            if abi_str.is_empty() {
                 return Err(ParsePlatformTagError::InvalidFormat {
                     platform: "android",
                     tag: s.to_string(),
                 });
             }
 
-            let arch = arch_str
+            let abi = abi_str
                 .parse()
                 .map_err(|_| ParsePlatformTagError::InvalidArch {
                     platform: "android",
                     tag: s.to_string(),
                 })?;
 
-            return Ok(Self::Android { api_level, arch });
+            return Ok(Self::Android { api_level, abi });
         }
 
         if let Some(rest) = s.strip_prefix("freebsd_") {
@@ -531,9 +725,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::FreeBsd {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -545,9 +740,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::NetBsd {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -559,9 +755,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::OpenBsd {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -573,9 +770,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::Dragonfly {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -587,9 +785,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::Haiku {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -601,9 +800,10 @@ impl FromStr for PlatformTag {
                     tag: s.to_string(),
                 });
             }
-
             return Ok(Self::Illumos {
-                release_arch: SmallString::from(rest),
+                release_arch: rest
+                    .parse::<ReleaseArch>()
+                    .map_err(|_| ParsePlatformTagError::InvalidCharacters { tag: s.to_string() })?,
             });
         }
 
@@ -619,7 +819,9 @@ impl FromStr for PlatformTag {
             if let Some(release_arch) = rest.strip_suffix("_64bit") {
                 if !release_arch.is_empty() {
                     return Ok(Self::Solaris {
-                        release_arch: SmallString::from(release_arch),
+                        release_arch: release_arch.parse::<ReleaseArch>().map_err(|_| {
+                            ParsePlatformTagError::InvalidCharacters { tag: s.to_string() }
+                        })?,
                     });
                 }
             }
@@ -659,9 +861,65 @@ impl FromStr for PlatformTag {
             return Ok(Self::Pyodide { major, minor });
         }
 
+        if let Some(rest) = s.strip_prefix("ios_") {
+            // Ex) ios_13_0_arm64_iphoneos
+            let first_underscore = memchr::memchr(b'_', rest.as_bytes()).ok_or_else(|| {
+                ParsePlatformTagError::InvalidFormat {
+                    platform: "ios",
+                    tag: s.to_string(),
+                }
+            })?;
+
+            let second_underscore = memchr::memchr(b'_', &rest.as_bytes()[first_underscore + 1..])
+                .map(|i| i + first_underscore + 1)
+                .ok_or_else(|| ParsePlatformTagError::InvalidFormat {
+                    platform: "ios",
+                    tag: s.to_string(),
+                })?;
+
+            let major = rest[..first_underscore].parse().map_err(|_| {
+                ParsePlatformTagError::InvalidMajorVersion {
+                    platform: "ios",
+                    tag: s.to_string(),
+                }
+            })?;
+
+            let minor = rest[first_underscore + 1..second_underscore]
+                .parse()
+                .map_err(|_| ParsePlatformTagError::InvalidMinorVersion {
+                    platform: "ios",
+                    tag: s.to_string(),
+                })?;
+
+            let multiarch = &rest[second_underscore + 1..];
+            if multiarch.is_empty() {
+                return Err(ParsePlatformTagError::InvalidFormat {
+                    platform: "ios",
+                    tag: s.to_string(),
+                });
+            }
+
+            let multiarch = multiarch
+                .parse()
+                .map_err(|_| ParsePlatformTagError::InvalidArch {
+                    platform: "ios",
+                    tag: s.to_string(),
+                })?;
+
+            return Ok(Self::Ios {
+                major,
+                minor,
+                multiarch,
+            });
+        }
+
         Err(ParsePlatformTagError::UnknownFormat(s.to_string()))
     }
 }
+
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[error("release and architecture must contain only ASCII letters, digits, and underscores")]
+pub struct ParseReleaseArchError;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParsePlatformTagError {
@@ -677,13 +935,19 @@ pub enum ParsePlatformTagError {
     InvalidArch { platform: &'static str, tag: String },
     #[error("Invalid API level in {platform} platform tag: {tag}")]
     InvalidApiLevel { platform: &'static str, tag: String },
+    #[error("Platform tag must contain only ASCII letters, digits, and underscores: {tag}")]
+    InvalidCharacters { tag: String },
 }
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use crate::platform_tag::{ParsePlatformTagError, PlatformTag};
+    use crate::platform_tag::{
+        ParsePlatformTagError, ParseReleaseArchError, PlatformTag, ReleaseArch,
+    };
+    use crate::tags::AndroidAbi;
+    use crate::tags::IosMultiarch;
     use crate::{Arch, BinaryFormat};
 
     #[test]
@@ -900,45 +1164,91 @@ mod tests {
     }
 
     #[test]
-    fn freebsd_platform() {
-        let tag = PlatformTag::FreeBsd {
-            release_arch: "13_14_x86_64".into(),
-        };
+    fn release_arch() {
         assert_eq!(
-            PlatformTag::from_str("freebsd_13_14_x86_64").as_ref(),
-            Ok(&tag)
+            ReleaseArch::from_str("13_14_x86_64").map(|release_arch| release_arch.to_string()),
+            Ok("13_14_x86_64".to_string())
         );
-        assert_eq!(tag.to_string(), "freebsd_13_14_x86_64");
+        assert_eq!(
+            ReleaseArch::from_str("13_x86/64"),
+            Err(ParseReleaseArchError)
+        );
+    }
+
+    #[test]
+    fn freebsd_platform() {
+        assert_eq!(
+            PlatformTag::from_str("freebsd_13_14_x86_64")
+                .as_ref()
+                .map(ToString::to_string),
+            Ok("freebsd_13_14_x86_64".to_string())
+        );
     }
 
     #[test]
     fn illumos_platform() {
-        let tag = PlatformTag::Illumos {
-            release_arch: "5_11_x86_64".into(),
-        };
         assert_eq!(
-            PlatformTag::from_str("illumos_5_11_x86_64").as_ref(),
-            Ok(&tag)
+            PlatformTag::from_str("illumos_5_11_x86_64")
+                .as_ref()
+                .map(ToString::to_string),
+            Ok("illumos_5_11_x86_64".to_string())
         );
-        assert_eq!(tag.to_string(), "illumos_5_11_x86_64");
     }
 
     #[test]
     fn solaris_platform() {
-        let tag = PlatformTag::Solaris {
-            release_arch: "11_4_x86_64".into(),
-        };
         assert_eq!(
-            PlatformTag::from_str("solaris_11_4_x86_64_64bit").as_ref(),
-            Ok(&tag)
+            PlatformTag::from_str("solaris_11_4_x86_64_64bit")
+                .as_ref()
+                .map(ToString::to_string),
+            Ok("solaris_11_4_x86_64_64bit".to_string())
         );
-        assert_eq!(tag.to_string(), "solaris_11_4_x86_64_64bit");
 
         assert_eq!(
             PlatformTag::from_str("solaris_11_4_x86_64"),
             Err(ParsePlatformTagError::InvalidArch {
                 platform: "solaris",
                 tag: "solaris_11_4_x86_64".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_characters_platform() {
+        assert_eq!(
+            PlatformTag::from_str("freebsd_13_x86/64"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: "freebsd_13_x86/64".to_string()
+            })
+        );
+        assert_eq!(
+            PlatformTag::from_str(r"netbsd_9_x86\64"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: r"netbsd_9_x86\64".to_string()
+            })
+        );
+        assert_eq!(
+            PlatformTag::from_str("solaris_11_4_x86:64_64bit"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: "solaris_11_4_x86:64_64bit".to_string()
+            })
+        );
+        assert_eq!(
+            PlatformTag::from_str("freebsd_13.14_x86_64"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: "freebsd_13.14_x86_64".to_string()
+            })
+        );
+        assert_eq!(
+            PlatformTag::from_str("freebsd_13 x86_64"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: "freebsd_13 x86_64".to_string()
+            })
+        );
+        assert_eq!(
+            PlatformTag::from_str("freebsd_13_x86\u{e9}"),
+            Err(ParsePlatformTagError::InvalidCharacters {
+                tag: "freebsd_13_x86\u{e9}".to_string()
             })
         );
     }
@@ -960,6 +1270,73 @@ mod tests {
             Err(ParsePlatformTagError::InvalidArch {
                 platform: "pyodide",
                 tag: "pyodide_2024_0_wasm64".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn android_platform() {
+        let tag = PlatformTag::Android {
+            api_level: 21,
+            abi: AndroidAbi::Arm64V8a,
+        };
+        assert_eq!(
+            PlatformTag::from_str("android_21_arm64_v8a").as_ref(),
+            Ok(&tag)
+        );
+        assert_eq!(tag.to_string(), "android_21_arm64_v8a");
+
+        assert_eq!(
+            PlatformTag::from_str("android_X_arm64_v8a"),
+            Err(ParsePlatformTagError::InvalidApiLevel {
+                platform: "android",
+                tag: "android_X_arm64_v8a".to_string()
+            })
+        );
+
+        assert_eq!(
+            PlatformTag::from_str("android_21_aarch64"),
+            Err(ParsePlatformTagError::InvalidArch {
+                platform: "android",
+                tag: "android_21_aarch64".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn ios_platform() {
+        let tag = PlatformTag::Ios {
+            major: 13,
+            minor: 0,
+            multiarch: IosMultiarch::Arm64Device,
+        };
+        assert_eq!(
+            PlatformTag::from_str("ios_13_0_arm64_iphoneos").as_ref(),
+            Ok(&tag)
+        );
+        assert_eq!(tag.to_string(), "ios_13_0_arm64_iphoneos");
+
+        assert_eq!(
+            PlatformTag::from_str("ios_x_0_arm64_iphoneos"),
+            Err(ParsePlatformTagError::InvalidMajorVersion {
+                platform: "ios",
+                tag: "ios_x_0_arm64_iphoneos".to_string()
+            })
+        );
+
+        assert_eq!(
+            PlatformTag::from_str("ios_13_x_arm64_iphoneos"),
+            Err(ParsePlatformTagError::InvalidMinorVersion {
+                platform: "ios",
+                tag: "ios_13_x_arm64_iphoneos".to_string()
+            })
+        );
+
+        assert_eq!(
+            PlatformTag::from_str("ios_13_0_invalid_iphoneos"),
+            Err(ParsePlatformTagError::InvalidArch {
+                platform: "ios",
+                tag: "ios_13_0_invalid_iphoneos".to_string()
             })
         );
     }

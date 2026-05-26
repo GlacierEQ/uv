@@ -86,7 +86,7 @@ impl DependencyGroups {
     }
 
     /// Create from raw CLI args
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[expect(clippy::fn_params_excessive_bools)]
     pub fn from_args(
         dev: bool,
         no_dev: bool,
@@ -179,11 +179,6 @@ impl DependencyGroupsInner {
     pub fn contains(&self, group: &GroupName) -> bool {
         // exclude always trumps include
         !self.exclude.contains(group) && self.include.contains(group)
-    }
-
-    /// Iterate over all groups that we think should exist.
-    pub fn desugarred_names(&self) -> impl Iterator<Item = &GroupName> {
-        self.include.names().chain(&self.exclude)
     }
 
     /// Returns an iterator over all groups that are included in the specification,
@@ -341,7 +336,7 @@ pub enum DevMode {
 
 impl DevMode {
     /// Returns the flag that was used to request development dependencies.
-    pub fn as_flag(&self) -> &'static str {
+    fn as_flag(self) -> &'static str {
         match self {
             Self::Exclude => "--no-dev",
             Self::Include => "--dev",

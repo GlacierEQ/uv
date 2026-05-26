@@ -2,30 +2,13 @@
 
 use std::env::consts::EXE_EXTENSION;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-/// Append an extension to a [`PathBuf`].
-///
-/// Unlike [`Path::with_extension`], this function does not replace an existing extension.
-///
-/// If there is no file name, the path is returned unchanged.
-///
-/// This mimics the behavior of the unstable [`Path::with_added_extension`] method.
-fn add_extension_to_path(mut path: PathBuf, extension: &str) -> PathBuf {
-    let Some(name) = path.file_name() else {
-        // If there is no file name, we cannot add an extension.
-        return path;
-    };
-    let mut name = name.to_os_string();
-    name.push(".");
-    name.push(extension.trim_start_matches('.'));
-    path.set_file_name(name);
-    path
-}
+pub struct WindowsRunnable;
 
 #[derive(Debug)]
-pub enum WindowsRunnable {
+enum WindowsRunnableKind {
     /// Windows PE (.exe)
     Executable,
     /// `PowerShell` script (.ps1)
@@ -36,7 +19,7 @@ pub enum WindowsRunnable {
     Batch,
 }
 
-impl WindowsRunnable {
+impl WindowsRunnableKind {
     /// Returns a list of all supported Windows runnable types.
     fn all() -> &'static [Self] {
         &[
@@ -84,7 +67,9 @@ impl WindowsRunnable {
             }
         }
     }
+}
 
+impl WindowsRunnable {
     /// Handle console and legacy setuptools scripts for Windows.
     ///
     /// Returns [`Command`] that can be used to invoke a supported runnable on Windows
@@ -96,7 +81,7 @@ impl WindowsRunnable {
         if let Some(script_type) = script_path
             .extension()
             .and_then(OsStr::to_str)
-            .and_then(Self::from_extension)
+            .and_then(WindowsRunnableKind::from_extension)
             .filter(|_| script_path.is_file())
         {
             return script_type.as_command(&script_path);
@@ -104,12 +89,12 @@ impl WindowsRunnable {
 
         // Guess the extension when an explicit one is not provided.
         // We also add the extension when missing since for some types (e.g. PowerShell) it must be explicit.
-        Self::all()
+        WindowsRunnableKind::all()
             .iter()
             .map(|script_type| {
                 (
                     script_type,
-                    add_extension_to_path(script_path.clone(), script_type.to_extension()),
+                    script_path.with_added_extension(script_type.to_extension()),
                 )
             })
             .find(|(_, script_path)| script_path.is_file())
@@ -120,49 +105,15 @@ impl WindowsRunnable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::path::PathBuf;
 
+    #[cfg(target_os = "windows")]
+    use super::WindowsRunnable;
     #[cfg(target_os = "windows")]
     use fs_err as fs;
     #[cfg(target_os = "windows")]
+    use std::ffi::OsStr;
+    #[cfg(target_os = "windows")]
     use std::io;
-
-    #[test]
-    fn test_add_extension_to_path() {
-        // Test with simple package name (no dots)
-        let path = PathBuf::from("python");
-        let result = add_extension_to_path(path, "exe");
-        assert_eq!(result, PathBuf::from("python.exe"));
-
-        // Test with package name containing single dot
-        let path = PathBuf::from("awslabs.cdk-mcp-server");
-        let result = add_extension_to_path(path, "exe");
-        assert_eq!(result, PathBuf::from("awslabs.cdk-mcp-server.exe"));
-
-        // Test with package name containing multiple dots
-        let path = PathBuf::from("org.example.tool");
-        let result = add_extension_to_path(path, "exe");
-        assert_eq!(result, PathBuf::from("org.example.tool.exe"));
-
-        // Test with different extensions
-        let path = PathBuf::from("script");
-        let result = add_extension_to_path(path, "ps1");
-        assert_eq!(result, PathBuf::from("script.ps1"));
-
-        // Test with path that has directory components
-        let path = PathBuf::from("some/path/to/awslabs.cdk-mcp-server");
-        let result = add_extension_to_path(path, "exe");
-        assert_eq!(
-            result,
-            PathBuf::from("some/path/to/awslabs.cdk-mcp-server.exe")
-        );
-
-        // Test with empty path (edge case)
-        let path = PathBuf::new();
-        let result = add_extension_to_path(path.clone(), "exe");
-        assert_eq!(result, path); // Should return unchanged
-    }
 
     /// Helper function to create a temporary directory with test files
     #[cfg(target_os = "windows")]

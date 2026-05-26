@@ -3,10 +3,12 @@ use std::collections::btree_map::{BTreeMap, Entry};
 use std::ops::RangeBounds;
 use std::sync::OnceLock;
 
+use jiff::Timestamp;
 use pubgrub::Ranges;
-use tracing::instrument;
+use rustc_hash::FxHashMap;
+use tracing::{instrument, trace};
 
-use uv_client::{FlatIndexEntry, OwnedArchive, SimpleMetadata, VersionFiles};
+use uv_client::{FlatIndexEntry, OwnedArchive, SimpleDetailMetadata, VersionFiles};
 use uv_configuration::BuildOptions;
 use uv_distribution_filename::{DistFilename, WheelFilename};
 use uv_distribution_types::{
@@ -17,12 +19,12 @@ use uv_distribution_types::{
 use uv_normalize::PackageName;
 use uv_pep440::Version;
 use uv_platform_tags::{IncompatibleTag, TagCompatibility, Tags};
-use uv_pypi_types::{HashDigest, Yanked};
+use uv_pypi_types::{HashDigest, ResolutionMetadata, Yanked};
 use uv_types::HashStrategy;
 use uv_warnings::warn_user_once;
 
 use crate::flat_index::FlatDistributions;
-use crate::{ExcludeNewer, ExcludeNewerTimestamp, yanks::AllowedYanks};
+use crate::yanks::AllowedYanks;
 
 /// A map from versions to distributions.
 #[derive(Debug)]
@@ -43,26 +45,40 @@ impl VersionMap {
     /// PEP 592: <https://peps.python.org/pep-0592/#warehouse-pypi-implementation-notes>
     #[instrument(skip_all, fields(package_name))]
     pub(crate) fn from_simple_metadata(
-        simple_metadata: OwnedArchive<SimpleMetadata>,
+        simple_metadata: OwnedArchive<SimpleDetailMetadata>,
         package_name: &PackageName,
         index: &IndexUrl,
         tags: Option<&Tags>,
         requires_python: &RequiresPython,
         allowed_yanks: &AllowedYanks,
         hasher: &HashStrategy,
-        exclude_newer: Option<&ExcludeNewer>,
+        included_version_cutoff: Option<Timestamp>,
+        available_version_cutoff: Option<Timestamp>,
         flat_index: Option<FlatDistributions>,
         build_options: &BuildOptions,
     ) -> Self {
         let mut stable = false;
         let mut local = false;
         let mut map = BTreeMap::new();
+        let mut core_metadata = FxHashMap::default();
         // Create stubs for each entry in simple metadata. The full conversion
         // from a `VersionFiles` to a PrioritizedDist for each version
         // isn't done until that specific version is requested.
         for (datum_index, datum) in simple_metadata.iter().enumerate() {
+            // Deserialize the version.
             let version = rkyv::deserialize::<Version, rkyv::rancor::Error>(&datum.version)
                 .expect("archived version always deserializes");
+
+            // Deserialize the metadata.
+            let core_metadatum =
+                rkyv::deserialize::<Option<ResolutionMetadata>, rkyv::rancor::Error>(
+                    &datum.metadata,
+                )
+                .expect("archived metadata always deserializes");
+            if let Some(core_metadatum) = core_metadatum {
+                core_metadata.insert(version.clone(), core_metadatum);
+            }
+
             stable |= version.is_stable();
             local |= version.is_local();
             map.insert(
@@ -104,6 +120,7 @@ impl VersionMap {
                 map,
                 stable,
                 local,
+                core_metadata,
                 simple_metadata,
                 no_binary: build_options.no_binary_package(package_name),
                 no_build: build_options.no_build_package(package_name),
@@ -112,7 +129,8 @@ impl VersionMap {
                 allowed_yanks: allowed_yanks.clone(),
                 hasher: hasher.clone(),
                 requires_python: requires_python.clone(),
-                exclude_newer: exclude_newer.and_then(|en| en.exclude_newer_package(package_name)),
+                included_version_cutoff,
+                available_version_cutoff,
             }),
         }
     }
@@ -141,6 +159,14 @@ impl VersionMap {
         }
     }
 
+    /// Return the [`ResolutionMetadata`] for the given version, if any.
+    pub(crate) fn get_metadata(&self, version: &Version) -> Option<&ResolutionMetadata> {
+        match self.inner {
+            VersionMapInner::Eager(_) => None,
+            VersionMapInner::Lazy(ref lazy) => lazy.core_metadata.get(version),
+        }
+    }
+
     /// Return the [`DistFile`] for the given version, if any.
     pub(crate) fn get(&self, version: &Version) -> Option<&PrioritizedDist> {
         match self.inner {
@@ -162,6 +188,14 @@ impl VersionMap {
         match &self.inner {
             VersionMapInner::Eager(_) => None,
             VersionMapInner::Lazy(lazy) => Some(&lazy.index),
+        }
+    }
+
+    /// Return the included-version cutoff for this version map, if any.
+    pub(crate) fn included_version_cutoff(&self) -> Option<&Timestamp> {
+        match &self.inner {
+            VersionMapInner::Eager(_) => None,
+            VersionMapInner::Lazy(lazy) => lazy.included_version_cutoff.as_ref(),
         }
     }
 
@@ -310,7 +344,7 @@ impl<'a> VersionMapDistHandle<'a> {
 
 /// The kind of internal version map we have.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 enum VersionMapInner {
     /// All distributions are fully materialized in memory.
     ///
@@ -319,7 +353,7 @@ enum VersionMapInner {
     Eager(VersionMapEager),
     /// Some distributions might be fully materialized (i.e., by initializing
     /// a `VersionMap` with a `FlatDistributions`), but some distributions
-    /// might still be in their "raw" `SimpleMetadata` format. In this case, a
+    /// might still be in their "raw" `SimpleDetailMetadata` format. In this case, a
     /// `PrioritizedDist` isn't actually created in memory until the
     /// specific version has been requested.
     Lazy(VersionMapLazy),
@@ -340,7 +374,7 @@ struct VersionMapEager {
 ///
 /// The idea here is that some packages have a lot of versions published, and
 /// needing to materialize a full `VersionMap` with all corresponding metadata
-/// for every version in memory is expensive. Since a `SimpleMetadata` can be
+/// for every version in memory is expensive. Since a `SimpleDetailMetadata` can be
 /// materialized with very little cost (via `rkyv` in the warm cached case),
 /// avoiding another conversion step into a fully filled out `VersionMap` can
 /// provide substantial savings in some cases.
@@ -352,9 +386,11 @@ struct VersionMapLazy {
     stable: bool,
     /// Whether the version map contains at least one local version.
     local: bool,
+    /// The pre-populated metadata for each version.
+    core_metadata: FxHashMap<Version, ResolutionMetadata>,
     /// The raw simple metadata from which `PrioritizedDist`s should
     /// be constructed.
-    simple_metadata: OwnedArchive<SimpleMetadata>,
+    simple_metadata: OwnedArchive<SimpleDetailMetadata>,
     /// When true, wheels aren't allowed.
     no_binary: bool,
     /// When true, source dists aren't allowed.
@@ -364,8 +400,11 @@ struct VersionMapLazy {
     /// The set of compatibility tags that determines whether a wheel is usable
     /// in the current environment.
     tags: Option<Tags>,
-    /// Whether files newer than this timestamp should be excluded or not.
-    exclude_newer: Option<ExcludeNewerTimestamp>,
+    /// Files newer than this timestamp are considered excluded, i.e., that they cannot be selected by the
+    /// resolver.
+    included_version_cutoff: Option<Timestamp>,
+    /// Files newer than this timestamp are considered unavailable, i.e., that they do not exist.
+    available_version_cutoff: Option<Timestamp>,
     /// Which yanked versions are allowed
     allowed_yanks: AllowedYanks,
     /// The hashes of allowed distributions.
@@ -420,17 +459,38 @@ impl VersionMapLazy {
             for (filename, file) in files.all() {
                 // Support resolving as if it were an earlier timestamp, at least as long files have
                 // upload time information.
-                let (excluded, upload_time) = if let Some(exclude_newer) = &self.exclude_newer {
+                let (excluded, upload_time) = if let Some(included_version_cutoff) =
+                    &self.included_version_cutoff
+                {
                     match file.upload_time_utc_ms.as_ref() {
-                        Some(&upload_time) if upload_time >= exclude_newer.timestamp_millis() => {
+                        Some(&upload_time)
+                            if upload_time >= included_version_cutoff.as_millisecond() =>
+                        {
+                            trace!(
+                                "Excluding `{}` (uploaded {upload_time}) due to exclude-newer ({included_version_cutoff})",
+                                file.filename
+                            );
                             (true, Some(upload_time))
                         }
                         None => {
                             warn_user_once!(
-                                "{} is missing an upload date, but user provided: {exclude_newer}",
+                                "{} is missing an upload date, but user provided: {included_version_cutoff}",
                                 file.filename,
                             );
                             (true, None)
+                        }
+                        _ => (false, None),
+                    }
+                } else if let Some(available_version_cutoff) = &self.available_version_cutoff {
+                    match file.upload_time_utc_ms.as_ref() {
+                        Some(&upload_time)
+                            if upload_time >= available_version_cutoff.as_millisecond() =>
+                        {
+                            trace!(
+                                "Excluding `{}` (uploaded {upload_time}) due to available version cutoff ({available_version_cutoff})",
+                                file.filename
+                            );
+                            (true, Some(upload_time))
                         }
                         _ => (false, None),
                     }
@@ -527,7 +587,7 @@ impl VersionMapLazy {
         } else {
             if hashes.is_empty() {
                 HashComparison::Missing
-            } else if hashes.iter().any(|hash| required_hashes.contains(hash)) {
+            } else if hash_policy.matches(hashes) {
                 HashComparison::Matched
             } else {
                 HashComparison::Mismatched
@@ -591,7 +651,7 @@ impl VersionMapLazy {
         } else {
             if hashes.is_empty() {
                 HashComparison::Missing
-            } else if hashes.iter().any(|hash| required_hashes.contains(hash)) {
+            } else if hash_policy.matches(hashes) {
                 HashComparison::Matched
             } else {
                 HashComparison::Mismatched
@@ -613,7 +673,7 @@ enum LazyPrioritizedDist {
     /// `FlatDistributions`.
     OnlyFlat(PrioritizedDist),
     /// Represents a lazily constructed distribution from an index into a
-    /// `VersionFiles` from `SimpleMetadata`.
+    /// `VersionFiles` from `SimpleDetailMetadata`.
     OnlySimple(SimplePrioritizedDist),
     /// Combines the above. This occurs when we have data from both a flat
     /// distribution and a simple distribution.
@@ -626,7 +686,7 @@ enum LazyPrioritizedDist {
 /// Represents a lazily initialized `PrioritizedDist`.
 #[derive(Debug)]
 struct SimplePrioritizedDist {
-    /// An offset into `SimpleMetadata` corresponding to a `SimpleMetadatum`.
+    /// An offset into `SimpleDetailMetadata` corresponding to a `SimpleMetadatum`.
     /// This provides access to a `VersionFiles` that is used to construct a
     /// `PrioritizedDist`.
     datum_index: usize,

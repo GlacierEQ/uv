@@ -7,14 +7,19 @@ use url::Url;
 
 use uv_cache_info::CacheInfo;
 use uv_cache_key::{CanonicalUrl, RepositoryUrl};
+use uv_distribution_filename::ExpandedTags;
 use uv_distribution_types::{
     BuildInfo, BuildVariables, ConfigSettings, ExtraBuildRequirement, ExtraBuildRequires,
-    ExtraBuildVariables, InstalledDirectUrlDist, InstalledDist, PackageConfigSettings,
-    RequirementSource,
+    ExtraBuildVariables, InstalledDirectUrlDist, InstalledDist, InstalledDistKind,
+    PackageConfigSettings, RequirementSource,
 };
-use uv_git_types::GitOid;
+use uv_git_types::{GitLfs, GitOid};
 use uv_normalize::PackageName;
+use uv_pep440::Version;
+use uv_platform_tags::{AbiTag, IncompatibleTag, TagCompatibility, Tags};
 use uv_pypi_types::{DirInfo, DirectUrl, VcsInfo, VcsKind};
+
+use crate::InstallationStrategy;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum RequirementSatisfaction {
@@ -32,6 +37,9 @@ impl RequirementSatisfaction {
         name: &PackageName,
         distribution: &InstalledDist,
         source: &RequirementSource,
+        version: Option<&Version>,
+        installation: InstallationStrategy,
+        tags: &Tags,
         config_settings: &ConfigSettings,
         config_settings_package: &PackageConfigSettings,
         extra_build_requires: &ExtraBuildRequires,
@@ -55,7 +63,7 @@ impl RequirementSatisfaction {
             );
             dist_build_info != &build_info
         }) {
-            debug!("Build info mismatch for {name}: {distribution:?}");
+            debug!("Build info mismatch for {name}: {distribution}");
             return Self::OutOfDate;
         }
 
@@ -63,10 +71,29 @@ impl RequirementSatisfaction {
         match source {
             // If the requirement comes from a registry, check by name.
             RequirementSource::Registry { specifier, .. } => {
-                if specifier.contains(distribution.version()) {
-                    return Self::Satisfied;
+                // If the installed distribution is _not_ from a registry, reject it if and only if
+                // we're in a stateless install.
+                //
+                // For example: the `uv pip` CLI is stateful, in that it "respects"
+                // already-installed packages in the virtual environment. So if you run `uv pip
+                // install ./path/to/idna`, and then `uv pip install anyio` (which depends on
+                // `idna`), we'll "accept" the already-installed `idna` even though it is implicitly
+                // being "required" as a registry package.
+                //
+                // The `uv sync` CLI is stateless, in that all requirements must be defined
+                // declaratively ahead-of-time. So if you `uv sync` to install `./path/to/idna` and
+                // later `uv sync` to install `anyio`, we'll know (during that second sync) if the
+                // already-installed `idna` should come from the registry or not.
+                if installation == InstallationStrategy::Strict {
+                    if !matches!(distribution.kind, InstalledDistKind::Registry { .. }) {
+                        debug!("Distribution type mismatch for {name}: {distribution:?}");
+                        return Self::Mismatch;
+                    }
                 }
-                Self::Mismatch
+
+                if !specifier.contains(distribution.version()) {
+                    return Self::Mismatch;
+                }
             }
             RequirementSource::Url {
                 // We use the location since `direct_url.json` also stores this URL, e.g.
@@ -77,12 +104,12 @@ impl RequirementSatisfaction {
                 ext: _,
                 url: _,
             } => {
-                let InstalledDist::Url(InstalledDirectUrlDist {
+                let InstalledDistKind::Url(InstalledDirectUrlDist {
                     direct_url,
                     editable,
                     cache_info,
                     ..
-                }) = &distribution
+                }) = &distribution.kind
                 else {
                     return Self::Mismatch;
                 };
@@ -130,16 +157,14 @@ impl RequirementSatisfaction {
                         }
                     }
                 }
-
-                // Otherwise, assume the requirement is up-to-date.
-                Self::Satisfied
             }
-            RequirementSource::Git {
+            RequirementSource::GitDirectory {
                 url: _,
                 git: requested_git,
                 subdirectory: requested_subdirectory,
             } => {
-                let InstalledDist::Url(InstalledDirectUrlDist { direct_url, .. }) = &distribution
+                let InstalledDistKind::Url(InstalledDirectUrlDist { direct_url, .. }) =
+                    &distribution.kind
                 else {
                     return Self::Mismatch;
                 };
@@ -150,8 +175,10 @@ impl RequirementSatisfaction {
                             vcs: VcsKind::Git,
                             requested_revision: _,
                             commit_id: installed_precise,
+                            git_lfs: installed_git_lfs,
                         },
                     subdirectory: installed_subdirectory,
+                    path: None,
                 } = direct_url.as_ref()
                 else {
                     return Self::Mismatch;
@@ -165,13 +192,23 @@ impl RequirementSatisfaction {
                     return Self::Mismatch;
                 }
 
-                if !RepositoryUrl::parse(installed_url).is_ok_and(|installed_url| {
-                    installed_url == RepositoryUrl::new(requested_git.repository())
-                }) {
+                let requested_git_lfs = requested_git.lfs();
+                let installed_git_lfs = installed_git_lfs.map(GitLfs::from).unwrap_or_default();
+                if requested_git_lfs != installed_git_lfs {
+                    debug!(
+                        "Git LFS mismatch: {} (installed) vs. {} (requested)",
+                        installed_git_lfs, requested_git_lfs,
+                    );
+                    return Self::Mismatch;
+                }
+
+                if !RepositoryUrl::parse(installed_url)
+                    .is_ok_and(|installed_url| installed_url == *requested_git.repository())
+                {
                     debug!(
                         "Repository mismatch: {:?} vs. {:?}",
                         installed_url,
-                        requested_git.repository()
+                        requested_git.url()
                     );
                     return Self::Mismatch;
                 }
@@ -188,19 +225,84 @@ impl RequirementSatisfaction {
                     );
                     return Self::OutOfDate;
                 }
+            }
+            RequirementSource::GitPath {
+                url: _,
+                git: requested_git,
+                install_path: requested_path,
+                ext: _,
+            } => {
+                let InstalledDistKind::Url(InstalledDirectUrlDist { direct_url, .. }) =
+                    &distribution.kind
+                else {
+                    return Self::Mismatch;
+                };
+                let DirectUrl::VcsUrl {
+                    url: installed_url,
+                    vcs_info:
+                        VcsInfo {
+                            vcs: VcsKind::Git,
+                            requested_revision: _,
+                            commit_id: installed_precise,
+                            git_lfs: installed_git_lfs,
+                        },
+                    subdirectory: None,
+                    path: Some(installed_path),
+                } = direct_url.as_ref()
+                else {
+                    return Self::Mismatch;
+                };
 
-                Self::Satisfied
+                if requested_path != installed_path {
+                    debug!(
+                        "Path mismatch: {:?} vs. {:?}",
+                        installed_path, requested_path
+                    );
+                    return Self::Mismatch;
+                }
+
+                let requested_git_lfs = requested_git.lfs();
+                let installed_git_lfs = installed_git_lfs.map(GitLfs::from).unwrap_or_default();
+                if requested_git_lfs != installed_git_lfs {
+                    debug!(
+                        "Git LFS mismatch: {} (installed) vs. {} (requested)",
+                        installed_git_lfs, requested_git_lfs,
+                    );
+                    return Self::Mismatch;
+                }
+
+                if !RepositoryUrl::parse(installed_url)
+                    .is_ok_and(|installed_url| installed_url == *requested_git.repository())
+                {
+                    debug!(
+                        "Repository mismatch: {:?} vs. {:?}",
+                        installed_url,
+                        requested_git.url()
+                    );
+                    return Self::Mismatch;
+                }
+
+                if installed_precise.as_deref()
+                    != requested_git.precise().as_ref().map(GitOid::as_str)
+                {
+                    debug!(
+                        "Precise mismatch: {:?} vs. {:?}",
+                        installed_precise,
+                        requested_git.precise()
+                    );
+                    return Self::OutOfDate;
+                }
             }
             RequirementSource::Path {
                 install_path: requested_path,
                 ext: _,
                 url: _,
             } => {
-                let InstalledDist::Url(InstalledDirectUrlDist {
+                let InstalledDistKind::Url(InstalledDirectUrlDist {
                     direct_url,
                     cache_info,
                     ..
-                }) = &distribution
+                }) = &distribution.kind
                 else {
                     return Self::Mismatch;
                 };
@@ -244,8 +346,6 @@ impl RequirementSatisfaction {
                         return Self::CacheInvalid;
                     }
                 }
-
-                Self::Satisfied
             }
             RequirementSource::Directory {
                 install_path: requested_path,
@@ -253,11 +353,11 @@ impl RequirementSatisfaction {
                 r#virtual: _,
                 url: _,
             } => {
-                let InstalledDist::Url(InstalledDirectUrlDist {
+                let InstalledDistKind::Url(InstalledDirectUrlDist {
                     direct_url,
                     cache_info,
                     ..
-                }) = &distribution
+                }) = &distribution.kind
                 else {
                     return Self::Mismatch;
                 };
@@ -313,10 +413,38 @@ impl RequirementSatisfaction {
                         return Self::CacheInvalid;
                     }
                 }
-
-                Self::Satisfied
             }
         }
+
+        // If the distribution isn't compatible with the current platform, it is a mismatch.
+        if let Ok(Some(wheel_tags)) = distribution.read_tags() {
+            if !wheel_tags.is_compatible(tags) {
+                if let Some(hint) = generate_dist_compatibility_hint(wheel_tags, tags) {
+                    debug!("Platform tags mismatch for {distribution}: {hint}");
+                } else {
+                    debug!("Platform tags mismatch for {distribution}");
+                }
+                return Self::Mismatch;
+            }
+        }
+
+        // If a resolved version is provided, check that it matches the installed version.
+        // This is needed for sources that don't include explicit version specifiers (e.g.,
+        // directory dependencies with dynamic versioning), where the resolver may have determined
+        // a new version should be installed.
+        if let Some(version) = version {
+            if distribution.version() != version {
+                debug!(
+                    "Installed version does not match resolved version for {name}: {} vs. {}",
+                    distribution.version(),
+                    version
+                );
+                return Self::OutOfDate;
+            }
+        }
+
+        // Otherwise, assume the requirement is up-to-date.
+        Self::Satisfied
     }
 }
 
@@ -350,4 +478,152 @@ fn extra_build_variables_for<'settings>(
     extra_build_variables: &'settings ExtraBuildVariables,
 ) -> Option<&'settings BuildVariables> {
     extra_build_variables.get(name)
+}
+
+/// Generate a hint for explaining tag compatibility issues.
+// TODO(zanieb): We should refactor this to share logic with `generate_wheel_compatibility_hint`
+fn generate_dist_compatibility_hint(wheel_tags: &ExpandedTags, tags: &Tags) -> Option<String> {
+    let TagCompatibility::Incompatible(incompatible_tag) = wheel_tags.compatibility(tags) else {
+        return None;
+    };
+
+    match incompatible_tag {
+        IncompatibleTag::Python => {
+            let wheel_tags = wheel_tags.python_tags();
+            let current_tag = tags.python_tag();
+
+            if let Some(current) = current_tag {
+                let message = if let Some(pretty) = current.pretty() {
+                    format!("{pretty} (`{current}`)")
+                } else {
+                    format!("`{current}`")
+                };
+
+                Some(format!(
+                    "The distribution is compatible with {}, but you're using {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    message
+                ))
+            } else {
+                Some(format!(
+                    "The distribution requires {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+        IncompatibleTag::FreethreadedAbi => {
+            let wheel_abi = wheel_tags
+                .abi_tags()
+                .map(|tag| match tag {
+                    AbiTag::Abi3 => format!("the stable ABI (`{tag}`)"),
+                    _ => {
+                        if let Some(pretty) = tag.pretty() {
+                            format!("the {pretty} ABI (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let current = if let Some(current) = tags.abi_tag() {
+                if let Some(pretty) = current.pretty() {
+                    format!("{pretty} (`{current}`)")
+                } else {
+                    format!("`{current}`")
+                }
+            } else {
+                "free-threaded Python".to_string()
+            };
+            Some(format!(
+                "You're using {current}, but the distribution was built for {wheel_abi}, which requires a GIL-enabled interpreter"
+            ))
+        }
+        IncompatibleTag::Abi => {
+            let wheel_tags = wheel_tags.abi_tags();
+            let current_tag = tags.abi_tag();
+            if let Some(current) = current_tag {
+                let message = if let Some(pretty) = current.pretty() {
+                    format!("{pretty} (`{current}`)")
+                } else {
+                    format!("`{current}`")
+                };
+                Some(format!(
+                    "The distribution is compatible with {}, but you're using {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    message
+                ))
+            } else {
+                Some(format!(
+                    "The distribution requires {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+        IncompatibleTag::Platform => {
+            let wheel_tags = wheel_tags.platform_tags();
+            let current_tag = tags.platform_tag();
+
+            if let Some(current) = current_tag {
+                let message = if let Some(pretty) = current.pretty() {
+                    format!("{pretty} (`{current}`)")
+                } else {
+                    format!("`{current}`")
+                };
+                Some(format!(
+                    "The distribution is compatible with {}, but you're on {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    message
+                ))
+            } else {
+                Some(format!(
+                    "The distribution requires {}",
+                    wheel_tags
+                        .map(|tag| if let Some(pretty) = tag.pretty() {
+                            format!("{pretty} (`{tag}`)")
+                        } else {
+                            format!("`{tag}`")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        }
+        _ => None,
+    }
 }

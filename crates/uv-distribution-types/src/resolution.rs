@@ -118,11 +118,11 @@ pub enum ResolutionDiagnostic {
         /// The extra that was requested. For example, `colorama` in `black[colorama]`.
         extra: ExtraName,
     },
-    MissingDev {
+    MissingGroup {
         /// The distribution that was requested with a non-existent development dependency group.
         dist: ResolvedDist,
         /// The development dependency group that was requested.
-        dev: GroupName,
+        group: GroupName,
     },
     YankedVersion {
         /// The package that was requested with a yanked version. For example, `black==23.10.0`.
@@ -144,9 +144,9 @@ impl Diagnostic for ResolutionDiagnostic {
             Self::MissingExtra { dist, extra } => {
                 format!("The package `{dist}` does not have an extra named `{extra}`")
             }
-            Self::MissingDev { dist, dev } => {
+            Self::MissingGroup { dist, group } => {
                 format!(
-                    "The package `{dist}` does not have a development dependency group named `{dev}`"
+                    "The package `{dist}` does not have a development dependency group named `{group}`"
                 )
             }
             Self::YankedVersion { dist, reason } => {
@@ -170,7 +170,7 @@ impl Diagnostic for ResolutionDiagnostic {
     fn includes(&self, name: &PackageName) -> bool {
         match self {
             Self::MissingExtra { dist, .. } => name == dist.name(),
-            Self::MissingDev { dist, .. } => name == dist.name(),
+            Self::MissingGroup { dist, .. } => name == dist.name(),
             Self::YankedVersion { dist, .. } => name == dist.name(),
             Self::MissingLowerBound { package_name } => name == package_name,
         }
@@ -240,6 +240,12 @@ impl From<&ResolvedDist> for RequirementSource {
                     url: wheel.url.clone(),
                     ext: DistExtension::Wheel,
                 },
+                Dist::Built(BuiltDist::GitPath(wheel)) => Self::GitPath {
+                    url: wheel.url.clone(),
+                    git: (*wheel.git).clone(),
+                    install_path: wheel.install_path.clone(),
+                    ext: DistExtension::Wheel,
+                },
                 Dist::Source(SourceDist::Registry(sdist)) => Self::Registry {
                     specifier: uv_pep440::VersionSpecifiers::from(
                         uv_pep440::VersionSpecifier::equals_version(sdist.version.clone()),
@@ -257,7 +263,13 @@ impl From<&ResolvedDist> for RequirementSource {
                         ext: DistExtension::Source(sdist.ext),
                     }
                 }
-                Dist::Source(SourceDist::Git(sdist)) => Self::Git {
+                Dist::Source(SourceDist::GitPath(sdist)) => Self::GitPath {
+                    url: sdist.url.clone(),
+                    git: (*sdist.git).clone(),
+                    install_path: sdist.install_path.clone(),
+                    ext: DistExtension::Source(sdist.ext),
+                },
+                Dist::Source(SourceDist::GitDirectory(sdist)) => Self::GitDirectory {
                     git: (*sdist.git).clone(),
                     url: sdist.url.clone(),
                     subdirectory: sdist.subdirectory.clone(),

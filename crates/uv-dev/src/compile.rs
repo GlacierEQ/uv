@@ -4,7 +4,8 @@ use clap::Parser;
 use tracing::info;
 
 use uv_cache::{Cache, CacheArgs};
-use uv_configuration::{Concurrency, Preview};
+use uv_configuration::Concurrency;
+use uv_preview::Preview;
 use uv_python::{EnvironmentPreference, PythonEnvironment, PythonPreference, PythonRequest};
 
 #[derive(Parser)]
@@ -17,7 +18,7 @@ pub(crate) struct CompileArgs {
 }
 
 pub(crate) async fn compile(args: CompileArgs) -> anyhow::Result<()> {
-    let cache = Cache::try_from(args.cache_args)?.init()?;
+    let cache = Cache::try_from(args.cache_args)?.init().await?;
 
     let interpreter = if let Some(python) = args.python {
         python

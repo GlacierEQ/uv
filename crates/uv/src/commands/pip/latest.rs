@@ -3,7 +3,9 @@ use tracing::debug;
 
 use uv_client::{MetadataFormat, RegistryClient, VersionFiles};
 use uv_distribution_filename::DistFilename;
-use uv_distribution_types::{IndexCapabilities, IndexMetadataRef, IndexUrl, RequiresPython};
+use uv_distribution_types::{
+    IndexCapabilities, IndexLocations, IndexMetadataRef, IndexUrl, RequiresPython,
+};
 use uv_normalize::PackageName;
 use uv_platform_tags::Tags;
 use uv_resolver::{ExcludeNewer, PrereleaseMode};
@@ -12,30 +14,40 @@ use uv_warnings::warn_user_once;
 /// A client to fetch the latest version of a package from an index.
 ///
 /// The returned distribution is guaranteed to be compatible with the provided tags and Python
-/// requirement.
+/// requirement (if specified).
 #[derive(Debug, Clone)]
 pub(crate) struct LatestClient<'env> {
     pub(crate) client: &'env RegistryClient,
     pub(crate) capabilities: &'env IndexCapabilities,
     pub(crate) prerelease: PrereleaseMode,
-    pub(crate) exclude_newer: ExcludeNewer,
+    pub(crate) exclude_newer: &'env ExcludeNewer,
+    pub(crate) index_locations: &'env IndexLocations,
     pub(crate) tags: Option<&'env Tags>,
-    pub(crate) requires_python: &'env RequiresPython,
+    pub(crate) requires_python: Option<&'env RequiresPython>,
 }
 
 impl LatestClient<'_> {
+    fn effective_exclude_newer(
+        &self,
+        package: &PackageName,
+        index: &IndexUrl,
+    ) -> Option<jiff::Timestamp> {
+        self.exclude_newer
+            .exclude_newer_package_for_index(package, self.index_locations.exclude_newer_for(index))
+    }
+
     /// Find the latest version of a package from an index.
     pub(crate) async fn find_latest(
         &self,
         package: &PackageName,
         index: Option<&IndexUrl>,
         download_concurrency: &Semaphore,
-    ) -> anyhow::Result<Option<DistFilename>, uv_client::Error> {
+    ) -> Result<Option<DistFilename>, uv_client::Error> {
         debug!("Fetching latest version of: `{package}`");
 
         let archives = match self
             .client
-            .package_metadata(
+            .simple_detail(
                 package,
                 index.map(IndexMetadataRef::from),
                 self.capabilities,
@@ -46,7 +58,7 @@ impl LatestClient<'_> {
             Ok(archives) => archives,
             Err(err) => {
                 return match err.kind() {
-                    uv_client::ErrorKind::PackageNotFound(_) => Ok(None),
+                    uv_client::ErrorKind::RemotePackageNotFound(_) => Ok(None),
                     uv_client::ErrorKind::NoIndex(_) => Ok(None),
                     uv_client::ErrorKind::Offline(_) => Ok(None),
                     _ => Err(err),
@@ -55,10 +67,11 @@ impl LatestClient<'_> {
         };
 
         let mut latest: Option<DistFilename> = None;
-        for (_, archive) in archives {
+        for (index, archive) in archives {
             let MetadataFormat::Simple(archive) = archive else {
                 continue;
             };
+            let exclude_newer = self.effective_exclude_newer(package, index);
 
             for datum in archive.iter().rev() {
                 // Find the first compatible distribution.
@@ -70,18 +83,16 @@ impl LatestClient<'_> {
 
                 for (filename, file) in files.all() {
                     // Skip distributions uploaded after the cutoff.
-                    if let Some(exclude_newer) = self.exclude_newer.exclude_newer_package(package) {
+                    if let Some(exclude_newer) = &exclude_newer {
                         match file.upload_time_utc_ms.as_ref() {
-                            Some(&upload_time)
-                                if upload_time >= exclude_newer.timestamp_millis() =>
-                            {
+                            Some(&upload_time) if upload_time >= exclude_newer.as_millisecond() => {
                                 continue;
                             }
                             None => {
                                 warn_user_once!(
                                     "{} is missing an upload date, but user provided: {}",
                                     file.filename,
-                                    self.exclude_newer
+                                    exclude_newer
                                 );
                             }
                             _ => {}
@@ -101,14 +112,16 @@ impl LatestClient<'_> {
                     }
 
                     // Skip distributions that are incompatible with the Python requirement.
-                    if file
-                        .requires_python
-                        .as_ref()
-                        .is_some_and(|requires_python| {
-                            !self.requires_python.is_contained_by(requires_python)
-                        })
-                    {
-                        continue;
+                    if let Some(requires_python) = self.requires_python {
+                        if file
+                            .requires_python
+                            .as_ref()
+                            .is_some_and(|file_requires_python| {
+                                !requires_python.is_contained_by(file_requires_python)
+                            })
+                        {
+                            continue;
+                        }
                     }
 
                     // Skip distributions that are incompatible with the current platform.
@@ -135,10 +148,8 @@ impl LatestClient<'_> {
                 }
 
                 match (latest.as_ref(), best) {
-                    (Some(current), Some(best)) => {
-                        if best.version() > current.version() {
-                            latest = Some(best);
-                        }
+                    (Some(current), Some(best)) if best.version() > current.version() => {
+                        latest = Some(best);
                     }
                     (None, Some(best)) => {
                         latest = Some(best);
