@@ -11,7 +11,35 @@ use crate::ROOT_DIR;
 use crate::generate_all::Mode;
 
 /// Contains current supported targets
-const TARGETS_YML_URL: &str = "https://raw.githubusercontent.com/astral-sh/python-build-standalone/refs/tags/20260510/cpython-unix/targets.yml";
+const TARGETS_YML_URL: &str = "https://raw.githubusercontent.com/astral-sh/python-build-standalone/refs/tags/20261124/cpython-unix/targets.yml";
+
+// Preserve compiler paths embedded in older python-build-standalone archives, including custom builds.
+const HISTORICAL_CC_VALUES: [&str; 11] = [
+    "/usr/bin/aarch64-linux-gnu-gcc",
+    "/usr/bin/arm-linux-gnueabi-gcc",
+    "/usr/bin/arm-linux-gnueabihf-gcc",
+    "/usr/bin/loongarch64-linux-gnu-gcc",
+    "/usr/bin/mips-linux-gnu-gcc",
+    "/usr/bin/mipsel-linux-gnu-gcc",
+    "/usr/bin/powerpc64le-linux-gnu-gcc",
+    "/usr/bin/riscv64-linux-gnu-clang",
+    "/usr/bin/riscv64-linux-gnu-gcc",
+    "/usr/bin/s390x-linux-gnu-gcc",
+    "/usr/bin/x86_64-linux-gnu-gcc",
+];
+const HISTORICAL_CXX_VALUES: [&str; 11] = [
+    "/usr/bin/aarch64-linux-gnu-g++",
+    "/usr/bin/arm-linux-gnueabi-g++",
+    "/usr/bin/arm-linux-gnueabihf-g++",
+    "/usr/bin/loongarch64-linux-gnu-g++",
+    "/usr/bin/mips-linux-gnu-g++",
+    "/usr/bin/mipsel-linux-gnu-g++",
+    "/usr/bin/powerpc64le-linux-gnu-g++",
+    "/usr/bin/riscv64-linux-gnu-clang++",
+    "/usr/bin/riscv64-linux-gnu-g++",
+    "/usr/bin/s390x-linux-gnu-g++",
+    "/usr/bin/x86_64-linux-gnu-g++",
+];
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -32,7 +60,7 @@ pub(crate) async fn main(args: &Args) -> Result<()> {
     let filename = "generated_mappings.rs";
     let reference_path = PathBuf::from(ROOT_DIR)
         .join("crates")
-        .join("uv-python")
+        .join("uv-python-managed")
         .join("src")
         .join("sysconfig")
         .join(filename);
@@ -48,16 +76,16 @@ pub(crate) async fn main(args: &Args) -> Result<()> {
                 } else {
                     let comparison = StrComparison::new(&current, &reference_string);
                     bail!(
-                        "{filename} changed, please run `cargo dev generate-sysconfig-metadata`:\n{comparison}"
+                        "`{filename}` changed, please run `cargo dev generate-sysconfig-metadata`:\n{comparison}"
                     );
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                bail!("{filename} not found, please run `cargo dev generate-sysconfig-metadata`");
+                bail!("`{filename}` not found, please run `cargo dev generate-sysconfig-metadata`");
             }
             Err(err) => {
                 bail!(
-                    "{filename} changed, please run `cargo dev generate-sysconfig-metadata`:\n{err}"
+                    "`{filename}` changed, please run `cargo dev generate-sysconfig-metadata`:\n{err}"
                 );
             }
         },
@@ -76,7 +104,7 @@ pub(crate) async fn main(args: &Args) -> Result<()> {
             }
             Err(err) => {
                 bail!(
-                    "{filename} changed, please run `cargo dev generate-sysconfig-metadata`:\n{err}"
+                    "`{filename}` changed, please run `cargo dev generate-sysconfig-metadata`:\n{err}"
                 );
             }
         },
@@ -89,7 +117,7 @@ async fn generate() -> Result<String> {
     println!("Downloading python-build-standalone cpython-unix/targets.yml ...");
     let body = reqwest::get(TARGETS_YML_URL).await?.text().await?;
 
-    let parsed: BTreeMap<String, TargetConfig> = serde_yaml::from_str(&body)?;
+    let parsed: BTreeMap<String, TargetConfig> = yaml_serde::from_str(&body)?;
 
     let mut replacements: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
 
@@ -124,13 +152,30 @@ async fn generate() -> Result<String> {
         }
     }
 
+    for sysconfig_cc_entry in ["CC", "LDSHARED", "BLDSHARED", "LINKCC"] {
+        for from_cc in HISTORICAL_CC_VALUES {
+            replacements
+                .entry(sysconfig_cc_entry)
+                .or_default()
+                .insert(from_cc.to_string(), "cc".to_string());
+        }
+    }
+    for sysconfig_cxx_entry in ["CXX", "LDCXXSHARED"] {
+        for from_cxx in HISTORICAL_CXX_VALUES {
+            replacements
+                .entry(sysconfig_cxx_entry)
+                .or_default()
+                .insert(from_cxx.to_string(), "c++".to_string());
+        }
+    }
+
     let mut output = String::new();
 
     // Opening statements
     output.push_str("//! DO NOT EDIT\n");
     output.push_str("//!\n");
     output.push_str("//! Generated with `cargo run dev generate-sysconfig-metadata`\n");
-    output.push_str("//! Targets from <https://github.com/astral-sh/python-build-standalone/blob/20260510/cpython-unix/targets.yml>\n");
+    output.push_str("//! Targets from <https://github.com/astral-sh/python-build-standalone/blob/20261124/cpython-unix/targets.yml>\n");
     output.push_str("//!\n");
 
     // Disable clippy/fmt

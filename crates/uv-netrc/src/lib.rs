@@ -49,7 +49,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     /// Parsing error.
-    #[error("{parser} in the file '{filename}'")]
+    #[error("{parser} in the file `{filename}`")]
     Parsing {
         parser: netrc::ParsingError,
         filename: String,
@@ -88,7 +88,7 @@ impl Netrc {
     ///
     /// Look up the `NETRC` environment variable if it is defined else use the .netrc (or _netrc
     /// file on windows) in the user's home directory.
-    pub fn get_file() -> Option<PathBuf> {
+    fn get_file() -> Option<PathBuf> {
         let env_var = std::env::var("NETRC")
             .map(PathBuf::from)
             .map(|f| shellexpand::path::tilde(&f).into_owned());
@@ -108,6 +108,8 @@ impl Netrc {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -162,8 +164,7 @@ password hY5>yKqU&$vq&0
     #[test]
     fn test_from_file_failed() {
         let err = Netrc::from_file(Path::new("/netrc/file/not/exists/on/no/netrc")).unwrap_err();
-        assert!(
-            matches!(&err, Error::Io(err) if err.kind() == ErrorKind::NotFound),
+        assert_matches!(&err, Error::Io(err) if err.kind() == ErrorKind::NotFound,
             "expected NotFound I/O error, got {err}",
         );
     }

@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
+    mem,
     str::FromStr,
 };
 use uv_cache_key::CacheKeyHasher;
+use uv_macros::DeserializeUntagged;
 use uv_normalize::PackageName;
 
 #[derive(Debug, Clone)]
@@ -55,12 +57,15 @@ impl FromStr for ConfigSettingPackageEntry {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, DeserializeUntagged)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema), schemars(untagged))]
+#[serde(expecting = "a string or list of strings")]
 enum ConfigSettingValue {
     /// The value consists of a single string.
+    #[untagged(string)]
     String(String),
     /// The value consists of a list of strings.
+    #[untagged(seq)]
     List(Vec<String>),
 }
 
@@ -70,37 +75,6 @@ impl serde::Serialize for ConfigSettingValue {
             Self::String(value) => serializer.serialize_str(value),
             Self::List(values) => serializer.collect_seq(values.iter()),
         }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ConfigSettingValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = ConfigSettingValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a string or list of strings")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(ConfigSettingValue::String(value.to_string()))
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = seq.next_element()? {
-                    values.push(value);
-                }
-                Ok(ConfigSettingValue::List(values))
-            }
-        }
-
-        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -122,7 +96,7 @@ impl FromIterator<ConfigSettingEntry> for ConfigSettings {
                 }
                 Entry::Occupied(mut occupied) => match occupied.get_mut() {
                     ConfigSettingValue::String(existing) => {
-                        let existing = existing.clone();
+                        let existing = mem::take(existing);
                         occupied.insert(ConfigSettingValue::List(vec![existing, entry.value]));
                     }
                     ConfigSettingValue::List(existing) => {
@@ -136,13 +110,8 @@ impl FromIterator<ConfigSettingEntry> for ConfigSettings {
 }
 
 impl ConfigSettings {
-    /// Returns the number of settings in the configuration.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
     /// Returns `true` if the configuration contains no settings.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -162,7 +131,7 @@ impl ConfigSettings {
                 }
                 Entry::Occupied(mut occupied) => match occupied.get_mut() {
                     ConfigSettingValue::String(existing) => {
-                        let existing = existing.clone();
+                        let existing = mem::take(existing);
                         match value {
                             ConfigSettingValue::String(value) => {
                                 occupied.insert(ConfigSettingValue::List(vec![existing, value]));
@@ -270,11 +239,6 @@ impl PackageConfigSettings {
         self.0.get(package)
     }
 
-    /// Returns `true` if there are no package-specific settings.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Merge two sets of package config settings, with the values in `self` taking precedence.
     #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
@@ -284,7 +248,7 @@ impl PackageConfigSettings {
                     vacant.insert(settings);
                 }
                 Entry::Occupied(mut occupied) => {
-                    let merged = occupied.get().clone().merge(settings);
+                    let merged = mem::take(occupied.get_mut()).merge(settings);
                     occupied.insert(merged);
                 }
             }

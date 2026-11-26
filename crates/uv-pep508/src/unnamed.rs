@@ -8,6 +8,7 @@ use uv_normalize::ExtraName;
 
 use crate::marker::parse;
 use crate::verbatim_url::strip_host;
+use crate::verbatim_url::were_vars_expanded;
 use crate::{
     Cursor, MarkerEnvironment, MarkerTree, Pep508Error, Pep508ErrorSource, Pep508Url, Reporter,
     RequirementOrigin, Scheme, TracingReporter, VerbatimUrl, VerbatimUrlError, expand_env_vars,
@@ -32,6 +33,12 @@ pub trait UnnamedRequirementUrl: Pep508Url {
     #[must_use]
     fn with_given(self, given: impl AsRef<str>) -> Self;
 
+    /// Set the "given value contained variables which were expanded" flag.
+    #[must_use]
+    fn with_expanded(self, _expanded: bool) -> Self {
+        self
+    }
+
     /// Return the original string as given by the user, if available.
     fn given(&self) -> Option<&str>;
 }
@@ -41,11 +48,11 @@ impl UnnamedRequirementUrl for VerbatimUrl {
         path: impl AsRef<Path>,
         working_dir: impl AsRef<Path>,
     ) -> Result<Self, VerbatimUrlError> {
-        Self::from_path(path, working_dir)
+        Self::from_path_with_fragment(path, Some(working_dir.as_ref()))
     }
 
     fn parse_absolute_path(path: impl AsRef<Path>) -> Result<Self, Self::Err> {
-        Self::from_absolute_path(path)
+        Self::from_path_with_fragment(path, None)
     }
 
     fn parse_unnamed_url(given: impl AsRef<str>) -> Result<Self, Self::Err> {
@@ -54,6 +61,10 @@ impl UnnamedRequirementUrl for VerbatimUrl {
 
     fn with_given(self, given: impl AsRef<str>) -> Self {
         self.with_given(given)
+    }
+
+    fn with_expanded(self, expanded: bool) -> Self {
+        self.with_expanded(expanded)
     }
 
     fn given(&self) -> Option<&str> {
@@ -82,11 +93,6 @@ pub struct UnnamedRequirement<ReqUrl: UnnamedRequirementUrl = VerbatimUrl> {
 }
 
 impl<Url: UnnamedRequirementUrl> UnnamedRequirement<Url> {
-    /// Returns whether the markers apply for the given environment
-    pub fn evaluate_markers(&self, env: &MarkerEnvironment, extras: &[ExtraName]) -> bool {
-        self.evaluate_optional_environment(Some(env), extras)
-    }
-
     /// Returns whether the markers apply for the given environment
     pub fn evaluate_optional_environment(
         &self,
@@ -239,6 +245,7 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
 
     // Expand environment variables in the URL.
     let expanded = expand_env_vars(url);
+    let vars_expanded = were_vars_expanded(url, expanded.as_ref());
 
     if let Some((scheme, path)) = split_scheme(&expanded) {
         match Scheme::parse(scheme) {
@@ -259,7 +266,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                             len,
                             input: cursor.to_string(),
                         })?
-                        .with_given(url);
+                        .with_given(url)
+                        .with_expanded(vars_expanded);
                     return Ok((url, extras));
                 }
 
@@ -270,7 +278,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                         len,
                         input: cursor.to_string(),
                     })?
-                    .with_given(url);
+                    .with_given(url)
+                    .with_expanded(vars_expanded);
                 Ok((url, extras))
             }
             // Ex) `https://download.pytorch.org/whl/torch_stable.html`
@@ -283,7 +292,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                         len,
                         input: cursor.to_string(),
                     })?
-                    .with_given(url);
+                    .with_given(url)
+                    .with_expanded(vars_expanded);
                 Ok((url, extras))
             }
 
@@ -297,7 +307,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                             len,
                             input: cursor.to_string(),
                         })?
-                        .with_given(url);
+                        .with_given(url)
+                        .with_expanded(vars_expanded);
                     return Ok((url, extras));
                 }
 
@@ -308,7 +319,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                         len,
                         input: cursor.to_string(),
                     })?
-                    .with_given(url);
+                    .with_given(url)
+                    .with_expanded(vars_expanded);
                 Ok((url, extras))
             }
         }
@@ -322,7 +334,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                     len,
                     input: cursor.to_string(),
                 })?
-                .with_given(url);
+                .with_given(url)
+                .with_expanded(vars_expanded);
             return Ok((url, extras));
         }
 
@@ -333,7 +346,8 @@ fn preprocess_unnamed_url<Url: UnnamedRequirementUrl>(
                 len,
                 input: cursor.to_string(),
             })?
-            .with_given(url);
+            .with_given(url)
+            .with_expanded(vars_expanded);
         Ok((url, extras))
     }
 }

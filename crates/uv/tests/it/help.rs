@@ -3,13 +3,32 @@ use uv_static::EnvVars;
 use uv_test::uv_snapshot;
 
 #[test]
+fn cert_is_limited_to_pip() {
+    let context = uv_test::test_context_with_versions!(&[]);
+
+    uv_snapshot!(context.filters(), context.command()
+        .arg("sync")
+        .arg("--cert")
+        .arg("ca-bundle.pem"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: unexpected argument '--cert' found
+
+      tip: a similar argument exists: '--script'
+
+    Usage: uv sync --script <SCRIPT>
+
+    For more information, try '--help'.
+    ");
+}
+
+#[test]
 fn help() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     // The `uv help` command should show the long help message
     uv_snapshot!(context.filters(), context.help(), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     An extremely fast Python package manager.
 
@@ -27,6 +46,7 @@ fn help() {
       export                     Export the project's lockfile to an alternate format
       tree                       Display the project's dependency tree
       format                     Format Python code in the project
+      check                      Run checks on the project
       audit                      Audit the project's dependencies
       tool                       Run and install commands provided by Python packages
       python                     Manage Python versions and installations
@@ -81,8 +101,6 @@ fn help() {
               Display the uv version
 
     Use `uv help <command>` for more information on a specific command.
-
-    ----- stderr -----
     "#);
 }
 
@@ -91,8 +109,7 @@ fn help_flag() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.command().arg("--help"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     An extremely fast Python package manager.
 
@@ -110,6 +127,7 @@ fn help_flag() {
       export     Export the project's lockfile to an alternate format
       tree       Display the project's dependency tree
       format     Format Python code in the project
+      check      Run checks on the project
       audit      Audit the project's dependencies
       tool       Run and install commands provided by Python packages
       python     Manage Python versions and installations
@@ -163,8 +181,6 @@ fn help_flag() {
               Display the uv version
 
     Use `uv help` for more details.
-
-    ----- stderr -----
     "#);
 }
 
@@ -173,8 +189,7 @@ fn help_short_flag() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.command().arg("-h"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     An extremely fast Python package manager.
 
@@ -192,6 +207,7 @@ fn help_short_flag() {
       export     Export the project's lockfile to an alternate format
       tree       Display the project's dependency tree
       format     Format Python code in the project
+      check      Run checks on the project
       audit      Audit the project's dependencies
       tool       Run and install commands provided by Python packages
       python     Manage Python versions and installations
@@ -245,8 +261,6 @@ fn help_short_flag() {
               Display the uv version
 
     Use `uv help` for more details.
-
-    ----- stderr -----
     "#);
 }
 
@@ -255,8 +269,7 @@ fn help_flag_workspace() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.command().arg("workspace").arg("--help"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Inspect uv workspaces
 
@@ -306,8 +319,6 @@ fn help_flag_workspace() {
               Display the concise help for this command
 
     Use `uv help workspace` for more details.
-
-    ----- stderr -----
     "#);
 }
 
@@ -316,8 +327,7 @@ fn help_subcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("python"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Manage Python versions and installations
 
@@ -518,8 +528,6 @@ fn help_subcommand() {
               Display the concise help for this command
 
     Use `uv help python <command>` for more information on a specific command.
-
-    ----- stderr -----
     "#);
 }
 
@@ -528,8 +536,7 @@ fn help_subsubcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().env_remove(EnvVars::UV_PYTHON_INSTALL_DIR).arg("python").arg("install"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Download and install Python versions.
 
@@ -603,11 +610,31 @@ fn help_subsubcommand() {
 
               Distributions can be read from a local directory by using the `file://` URL scheme.
 
+          --graalpy-mirror <GRAALPY_MIRROR>
+              Set the URL to use as the source for downloading GraalPy installations.
+
+              The provided URL will replace `https://github.com/oracle/graalpython/releases/download`
+              in, e.g.,
+              `https://github.com/oracle/graalpython/releases/download/graal-24.2.2/graalpy-24.2.2-macos-aarch64.tar.gz`.
+
+              Distributions can be read from a local directory by using the `file://` URL scheme.
+
+          --pyodide-mirror <PYODIDE_MIRROR>
+              Set the URL to use as the source for downloading Pyodide installations.
+
+              The provided URL will replace `https://github.com/pyodide/pyodide/releases/download` in,
+              e.g.,
+              `https://github.com/pyodide/pyodide/releases/download/0.29.5/xbuildenv-0.29.5.tar.gz`.
+
+              Distributions can be read from a local directory by using the `file://` URL scheme.
+
           --python-downloads-json-url <PYTHON_DOWNLOADS_JSON_URL>
               URL pointing to JSON of custom Python installations
 
       -r, --reinstall
               Reinstall the requested Python version, if it's already installed.
+
+              If a minor version is requested, all matching installed patch versions are reinstalled.
 
               By default, uv will exit successfully if the version is already installed.
 
@@ -800,8 +827,6 @@ fn help_subsubcommand() {
 
       -h, --help
               Display the concise help for this command
-
-    ----- stderr -----
     "#);
 }
 
@@ -810,8 +835,7 @@ fn help_flag_subcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.command().arg("python").arg("--help"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Manage Python versions and installations
 
@@ -866,8 +890,6 @@ fn help_flag_subcommand() {
               Display the concise help for this command
 
     Use `uv help python` for more details.
-
-    ----- stderr -----
     "#);
 }
 
@@ -876,8 +898,7 @@ fn help_flag_subsubcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.command().arg("python").arg("install").arg("--help"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Download and install Python versions
 
@@ -897,6 +918,10 @@ fn help_flag_subsubcommand() {
               Set the URL to use as the source for downloading Python installations
           --pypy-mirror <PYPY_MIRROR>
               Set the URL to use as the source for downloading PyPy installations
+          --graalpy-mirror <GRAALPY_MIRROR>
+              Set the URL to use as the source for downloading GraalPy installations
+          --pyodide-mirror <PYODIDE_MIRROR>
+              Set the URL to use as the source for downloading Pyodide installations
           --python-downloads-json-url <PYTHON_DOWNLOADS_JSON_URL>
               URL pointing to JSON of custom Python installations
       -r, --reinstall
@@ -948,8 +973,6 @@ fn help_flag_subsubcommand() {
               Avoid discovering configuration files (`pyproject.toml`, `uv.toml`) [env: UV_NO_CONFIG=]
       -h, --help
               Display the concise help for this command
-
-    ----- stderr -----
     "#);
 }
 
@@ -958,10 +981,7 @@ fn help_unknown_subcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("foobar"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: There is no command `foobar` for `uv`. Did you mean one of:
         auth
@@ -975,6 +995,7 @@ fn help_unknown_subcommand() {
         export
         tree
         format
+        check
         audit
         tool
         python
@@ -989,10 +1010,7 @@ fn help_unknown_subcommand() {
     ");
 
     uv_snapshot!(context.filters(), context.help().arg("foo").arg("bar"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: There is no command `foo bar` for `uv`. Did you mean one of:
         auth
@@ -1006,6 +1024,7 @@ fn help_unknown_subcommand() {
         export
         tree
         format
+        check
         audit
         tool
         python
@@ -1025,10 +1044,7 @@ fn help_unknown_subsubcommand() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("python").arg("foobar"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: There is no command `foobar` for `uv python`. Did you mean one of:
         list
@@ -1047,8 +1063,7 @@ fn help_with_global_option() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("--no-cache"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     An extremely fast Python package manager.
 
@@ -1066,6 +1081,7 @@ fn help_with_global_option() {
       export                     Export the project's lockfile to an alternate format
       tree                       Display the project's dependency tree
       format                     Format Python code in the project
+      check                      Run checks on the project
       audit                      Audit the project's dependencies
       tool                       Run and install commands provided by Python packages
       python                     Manage Python versions and installations
@@ -1120,8 +1136,6 @@ fn help_with_global_option() {
               Display the uv version
 
     Use `uv help <command>` for more information on a specific command.
-
-    ----- stderr -----
     "#);
 }
 
@@ -1130,8 +1144,7 @@ fn help_with_help() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("--help"), @"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     Display documentation for a command
 
@@ -1139,8 +1152,6 @@ fn help_with_help() {
 
     Options:
       --no-pager Disable pager when printing help
-
-    ----- stderr -----
     ");
 }
 
@@ -1149,10 +1160,7 @@ fn help_with_version() {
     let context = uv_test::test_context_with_versions!(&[]);
 
     uv_snapshot!(context.filters(), context.help().arg("--version"), @"
-    success: false
-    exit_code: 2
-    ----- stdout -----
-
+    exit_code: 2 (failure)
     ----- stderr -----
     error: unexpected argument '--version' found
 
@@ -1171,8 +1179,7 @@ fn help_with_no_pager() {
     // We can't really test whether the --no-pager option works with a snapshot test.
     // It's still nice to have a test for the option to confirm the option exists.
     uv_snapshot!(context.filters(), context.help().arg("--no-pager"), @r#"
-    success: true
-    exit_code: 0
+    exit_code: 0 (success)
     ----- stdout -----
     An extremely fast Python package manager.
 
@@ -1190,6 +1197,7 @@ fn help_with_no_pager() {
       export                     Export the project's lockfile to an alternate format
       tree                       Display the project's dependency tree
       format                     Format Python code in the project
+      check                      Run checks on the project
       audit                      Audit the project's dependencies
       tool                       Run and install commands provided by Python packages
       python                     Manage Python versions and installations
@@ -1244,7 +1252,5 @@ fn help_with_no_pager() {
               Display the uv version
 
     Use `uv help <command>` for more information on a specific command.
-
-    ----- stderr -----
     "#);
 }

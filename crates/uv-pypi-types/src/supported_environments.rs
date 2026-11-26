@@ -1,5 +1,4 @@
-use std::str::FromStr;
-
+use serde::de::value::SeqAccessDeserializer;
 use serde::ser::SerializeSeq;
 
 use uv_pep508::MarkerTree;
@@ -32,11 +31,6 @@ impl SupportedEnvironments {
     /// Returns `true` if there are no supported environments.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Returns the number of supported environments.
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 }
 
@@ -83,22 +77,17 @@ impl<'de> serde::Deserialize<'de> for SupportedEnvironments {
             where
                 E: serde::de::Error,
             {
-                let marker = MarkerTree::from_str(value).map_err(serde::de::Error::custom)?;
+                let marker =
+                    MarkerTree::parse_environment(value).map_err(serde::de::Error::custom)?;
                 Ok(SupportedEnvironments(vec![marker]))
             }
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let mut markers = Vec::new();
-
-                while let Some(elem) = seq.next_element::<String>()? {
-                    let marker = MarkerTree::from_str(&elem).map_err(serde::de::Error::custom)?;
-                    markers.push(marker);
-                }
-
-                Ok(SupportedEnvironments(markers))
+                MarkerTree::deserialize_environment_list(SeqAccessDeserializer::new(seq))
+                    .map(SupportedEnvironments)
             }
         }
 

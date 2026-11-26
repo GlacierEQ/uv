@@ -50,34 +50,6 @@ pub enum Operator {
 }
 
 impl Operator {
-    /// Negates this operator, if a negation exists, so that it has the
-    /// opposite meaning.
-    ///
-    /// This returns a negated operator in every case except for the `~=`
-    /// operator. In that case, `None` is returned and callers may need to
-    /// handle its negation at a higher level. (For example, if it's negated
-    /// in the context of a marker expression, then the "compatible" version
-    /// constraint can be split into its component parts and turned into a
-    /// disjunction of the negation of each of those parts.)
-    ///
-    /// Note that this routine is not reversible in all cases. For example
-    /// `Operator::ExactEqual` negates to `Operator::NotEqual`, and
-    /// `Operator::NotEqual` in turn negates to `Operator::Equal`.
-    pub fn negate(self) -> Option<Self> {
-        Some(match self {
-            Self::Equal => Self::NotEqual,
-            Self::EqualStar => Self::NotEqualStar,
-            Self::ExactEqual => Self::NotEqual,
-            Self::NotEqual => Self::Equal,
-            Self::NotEqualStar => Self::EqualStar,
-            Self::TildeEqual => return None,
-            Self::LessThan => Self::GreaterThanEqual,
-            Self::LessThanEqual => Self::GreaterThan,
-            Self::GreaterThan => Self::LessThanEqual,
-            Self::GreaterThanEqual => Self::LessThan,
-        })
-    }
-
     /// Returns true if and only if this operator can be used in a version
     /// specifier with a version containing a non-empty local segment.
     ///
@@ -436,7 +408,7 @@ impl Version {
     /// The version `1.0min0` is smaller than all other `1.0` versions,
     /// like `1.0a1`, `1.0dev0`, etc.
     #[inline]
-    pub fn min(&self) -> Option<u64> {
+    pub(crate) fn min(&self) -> Option<u64> {
         match self.inner {
             VersionInner::Small { ref small } => small.min(),
             VersionInner::Full { ref full } => full.min,
@@ -449,7 +421,7 @@ impl Version {
     /// The version `1.0max0` is larger than all other `1.0` versions,
     /// like `1.0.post1`, `1.0+local`, etc.
     #[inline]
-    pub fn max(&self) -> Option<u64> {
+    pub(crate) fn max(&self) -> Option<u64> {
         match self.inner {
             VersionInner::Small { ref small } => small.max(),
             VersionInner::Full { ref full } => full.max,
@@ -482,6 +454,23 @@ impl Version {
             "release must have non-zero size"
         );
         self
+    }
+
+    /// Return this version's release component at the given precision.
+    ///
+    /// Preserve the epoch, pad missing release segments with zeros, and discard every other
+    /// component. Return `None` for a precision of zero.
+    #[inline]
+    #[must_use]
+    pub fn only_release_at_precision(&self, precision: usize) -> Option<Self> {
+        let release = self
+            .release()
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0))
+            .take(precision)
+            .collect::<Vec<_>>();
+        (!release.is_empty()).then(|| Self::new(release).with_epoch(self.epoch()))
     }
 
     /// Push the given release number into this version. It will become the
@@ -618,7 +607,7 @@ impl Version {
     /// Return the version with any segments apart from the minor version of the release removed.
     #[inline]
     #[must_use]
-    pub fn only_minor_release(&self) -> Self {
+    pub(crate) fn only_minor_release(&self) -> Self {
         Self::new(self.release().iter().take(2).copied())
     }
 
@@ -724,11 +713,11 @@ impl Version {
                     });
                 } else {
                     // Either bump the matching kind or set to 1
-                    if let Some(prerelease) = &mut full.pre {
-                        if prerelease.kind == kind {
-                            prerelease.number += 1;
-                            return;
-                        }
+                    if let Some(prerelease) = &mut full.pre
+                        && prerelease.kind == kind
+                    {
+                        prerelease.number += 1;
+                        return;
                     }
                     full.pre = Some(Prerelease { kind, number: 1 });
                 }
@@ -827,6 +816,32 @@ impl Version {
             VersionInner::Full { full } => Arc::make_mut(full),
             VersionInner::Small { .. } => unreachable!(),
         }
+    }
+
+    /// Compare this version, without its post and dev components, to another version.
+    #[inline]
+    pub(crate) fn without_post_and_dev_eq(&self, other: &Self) -> bool {
+        match (&self.inner, &other.inner) {
+            (VersionInner::Small { small }, VersionInner::Small { small: other }) => {
+                // Copy the inline representation without allocating.
+                let mut base = small.clone();
+                let _ = base.set_post(None);
+                let _ = base.set_dev(None);
+                base.repr == other.repr
+            }
+            (VersionInner::Small { .. }, VersionInner::Full { .. })
+            | (VersionInner::Full { .. }, VersionInner::Small { .. } | VersionInner::Full { .. }) => {
+                self.without_post_and_dev_eq_slow(other)
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn without_post_and_dev_eq_slow(&self, other: &Self) -> bool {
+        self.epoch() == other.epoch()
+            && compare_release(&self.release(), &other.release()) == Ordering::Equal
+            && sortable_tuple_with(self, None, None) == sortable_tuple(other)
     }
 
     /// Performs a "slow" but complete comparison between two versions.
@@ -1150,13 +1165,13 @@ pub enum BumpCommand {
 )]
 #[cfg_attr(feature = "rkyv", rkyv(derive(Debug, Eq, PartialEq, PartialOrd, Ord)))]
 struct VersionSmall {
+    /// The representation discussed above.
+    repr: u64,
     /// The number of segments in the release component.
     ///
     /// PEP 440 considers `1.2`  equivalent to `1.2.0.0`, but we want to preserve trailing zeroes
     /// in roundtrips, as the "full" version representation also does.
     len: u8,
-    /// The representation discussed above.
-    repr: u64,
     /// Force a niche into the aligned type so the [`Version`] enum is two words instead of three.
     _force_niche: NonZero<u8>,
 }
@@ -1222,10 +1237,7 @@ impl VersionSmall {
     #[inline]
     #[expect(clippy::unused_self)]
     fn set_epoch(&mut self, value: u64) -> bool {
-        if value != 0 {
-            return false;
-        }
-        true
+        value == 0
     }
 
     #[inline]
@@ -1618,7 +1630,7 @@ impl VersionPattern {
 
     /// Consumes this pattern and returns ownership of the underlying version.
     #[inline]
-    pub fn into_version(self) -> Version {
+    pub(crate) fn into_version(self) -> Version {
         self.version
     }
 
@@ -1746,12 +1758,12 @@ pub enum LocalVersionSlice<'a> {
 
 impl LocalVersion {
     /// Return an empty local version.
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Self::Segments(Vec::new())
     }
 
     /// Returns `true` if the local version is empty.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         match self {
             Self::Segments(segments) => segments.is_empty(),
             Self::Max => false,
@@ -1759,18 +1771,10 @@ impl LocalVersion {
     }
 
     /// Convert the local version segments into a slice.
-    pub fn as_slice(&self) -> LocalVersionSlice<'_> {
+    fn as_slice(&self) -> LocalVersionSlice<'_> {
         match self {
             Self::Segments(segments) => LocalVersionSlice::Segments(segments),
             Self::Max => LocalVersionSlice::Max,
-        }
-    }
-
-    /// Clear the local version segments, if they exist.
-    pub fn clear(&mut self) {
-        match self {
-            Self::Segments(segments) => segments.clear(),
-            Self::Max => *self = Self::Segments(Vec::new()),
         }
     }
 }
@@ -1832,7 +1836,7 @@ impl Ord for LocalVersionSlice<'_> {
 
 impl LocalVersionSlice<'_> {
     /// Return an empty local version.
-    pub const fn empty() -> Self {
+    const fn empty() -> Self {
         Self::Segments(&[])
     }
 
@@ -2026,6 +2030,15 @@ impl<'a> Parser<'a> {
     /// If the version string is not in the format of `w[.x[.y[.z]]]`, then
     /// this returns `None`.
     fn parse_fast(&self) -> Option<VersionPattern> {
+        if let [major, b'.', minor, b'.', patch] = self.v {
+            let major = major.wrapping_sub(b'0');
+            let minor = minor.wrapping_sub(b'0');
+            let patch = patch.wrapping_sub(b'0');
+            if major <= 9 && minor <= 9 && patch <= 9 {
+                return Some(Self::from_fast_release([major, minor, patch, 0], 3));
+            }
+        }
+
         let (mut prev_digit, mut cur, mut release, mut len) = (false, 0u8, [0u8; 4], 0u8);
         for &byte in self.v {
             if byte == b'.' {
@@ -2050,6 +2063,11 @@ impl<'a> Parser<'a> {
         }
         *release.get_mut(usize::from(len))? = cur;
         len += 1;
+        Some(Self::from_fast_release(release, len))
+    }
+
+    /// Builds the packed representation used by the numeric fast parser.
+    fn from_fast_release(release: [u8; 4], len: u8) -> VersionPattern {
         let small = VersionSmall {
             _force_niche: NonZero::<u8>::MIN,
             repr: (u64::from(release[0]) << 48)
@@ -2062,10 +2080,10 @@ impl<'a> Parser<'a> {
         };
         let inner = VersionInner::Small { small };
         let version = Version { inner };
-        Some(VersionPattern {
+        VersionPattern {
             version,
             wildcard: false,
-        })
+        }
     }
 
     /// Parses an optional initial epoch number and the first component of the
@@ -2438,7 +2456,7 @@ impl ReleaseNumbers {
                 if *len == 4 {
                     let mut numbers = numbers.to_vec();
                     numbers.push(n);
-                    *self = Self::Vec(numbers.clone());
+                    *self = Self::Vec(numbers);
                 } else {
                     numbers[*len] = n;
                     *len += 1;
@@ -2737,7 +2755,7 @@ impl From<VersionParseError> for VersionPatternParseError {
 
 /// Compare the release parts of two versions, e.g. `4.3.1` > `4.2`, `1.1.0` ==
 /// `1.1` and `1.16` < `1.19`
-pub(crate) fn compare_release(this: &[u64], other: &[u64]) -> Ordering {
+fn compare_release(this: &[u64], other: &[u64]) -> Ordering {
     if this.len() == other.len() {
         return this.cmp(other);
     }
@@ -2778,13 +2796,21 @@ pub(crate) fn compare_release(this: &[u64], other: &[u64]) -> Ordering {
 ///
 /// [pep440-suffix-ordering]: https://peps.python.org/pep-0440/#summary-of-permitted-suffixes-and-relative-ordering
 fn sortable_tuple(version: &Version) -> (u64, u64, Option<u64>, u64, LocalVersionSlice<'_>) {
+    sortable_tuple_with(version, version.post(), version.dev())
+}
+
+fn sortable_tuple_with(
+    version: &Version,
+    post: Option<u64>,
+    dev: Option<u64>,
+) -> (u64, u64, Option<u64>, u64, LocalVersionSlice<'_>) {
     // If the version is a "max" version, use a post version larger than any possible post version.
     let post = if version.max().is_some() {
         Some(u64::MAX)
     } else {
-        version.post()
+        post
     };
-    match (version.pre(), post, version.dev(), version.min()) {
+    match (version.pre(), post, dev, version.min()) {
         // min release
         (_pre, post, _dev, Some(n)) => (0, 0, post, n, version.local()),
         // dev release
@@ -3959,6 +3985,42 @@ mod tests {
         );
     }
 
+    // Exercise every version accepted by the specialized five-byte fast path.
+    // The non-digit cases ensure that it falls back to the general parser.
+    #[test]
+    fn parse_version_single_digit_release() {
+        for major in 0u8..=9 {
+            for minor in 0u8..=9 {
+                for patch in 0u8..=9 {
+                    let input = format!("{major}.{minor}.{patch}");
+                    assert_eq!(
+                        input.parse(),
+                        Ok(Version::new([
+                            u64::from(major),
+                            u64::from(minor),
+                            u64::from(patch),
+                        ])),
+                        "{input}"
+                    );
+                }
+            }
+        }
+
+        assert!("a.1.2".parse::<Version>().is_err());
+        assert_eq!(
+            "1.a.2"
+                .parse::<Version>()
+                .map(|version| version.to_string()),
+            Ok("1a2".to_string())
+        );
+        assert_eq!(
+            "1.2.a"
+                .parse::<Version>()
+                .map(|version| version.to_string()),
+            Ok("1.2a0".to_string())
+        );
+    }
+
     #[test]
     fn parse_version_pattern_valid() {
         let p = |s: &str| match Parser::new(s.as_bytes()).parse_pattern() {
@@ -4267,6 +4329,21 @@ mod tests {
     }
 
     #[test]
+    fn only_release_at_precision_preserves_epoch_and_discards_suffixes() {
+        let version = "1!2.3rc1.post2.dev3+local"
+            .parse::<Version>()
+            .expect("valid version");
+        assert_eq!(
+            version
+                .only_release_at_precision(4)
+                .expect("non-zero precision")
+                .to_string(),
+            "1!2.3.0.0"
+        );
+        assert_eq!(version.only_release_at_precision(0), None);
+    }
+
+    #[test]
     fn only_release_trimmed_discards_non_release_segments() {
         for version in ["1.2a1", "1.2.post1", "1!1.2", "1.2+local", "1.2.dev1"] {
             let version = version.parse::<Version>().unwrap();
@@ -4299,6 +4376,11 @@ mod tests {
     fn type_size() {
         assert_eq!(size_of::<VersionSmall>(), size_of::<usize>() * 2);
         assert_eq!(size_of::<Version>(), size_of::<usize>() * 2);
+        #[cfg(feature = "rkyv")]
+        {
+            assert_eq!(size_of::<rkyv::Archived<VersionSmall>>(), 16);
+            assert_eq!(size_of::<rkyv::Archived<Version>>(), 24);
+        }
     }
 
     /// Test major bumping

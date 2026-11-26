@@ -1,4 +1,5 @@
 use arcstr::ArcStr;
+use smallvec::SmallVec;
 use std::str::FromStr;
 use uv_normalize::{ExtraName, GroupName};
 use uv_pep440::{Version, VersionPattern, VersionSpecifier};
@@ -282,12 +283,23 @@ pub(crate) fn parse_marker_key_op_value<T: Pep508Url>(
                     parse_inverted_version_expr(&l_string, operator, key, reporter)
                 }
                 // '...' == <env key>
-                MarkerValue::MarkerEnvString(key) => Some(MarkerExpression::String {
-                    key,
-                    // Invert the operator to normalize the expression order.
-                    operator: operator.invert(),
-                    value: l_string,
-                }),
+                MarkerValue::MarkerEnvString(key) => {
+                    if operator == MarkerOperator::TildeEqual {
+                        reporter.report(
+                            MarkerWarningKind::LexicographicComparison,
+                            "Can't compare strings with `~=`, will be ignored".to_string(),
+                        );
+
+                        return Ok(None);
+                    }
+
+                    Some(MarkerExpression::String {
+                        key,
+                        // Invert the operator to normalize the expression order.
+                        operator: operator.invert(),
+                        value: l_string,
+                    })
+                }
                 // `"test" in extras` or `"dev" in dependency_groups`
                 MarkerValue::MarkerEnvList(key) => {
                     let operator =
@@ -611,41 +623,48 @@ fn parse_marker_or<T: Pep508Url>(
 fn parse_marker_op<T: Pep508Url, R: Reporter>(
     cursor: &mut Cursor,
     op: &str,
-    apply: fn(&mut MarkerTree, MarkerTree),
+    apply: fn(MarkerTree, MarkerTree) -> MarkerTree,
     parse_inner: fn(&mut Cursor, &mut R) -> Result<Option<MarkerTree>, Pep508Error<T>>,
     reporter: &mut R,
 ) -> Result<Option<MarkerTree>, Pep508Error<T>> {
-    let mut tree = None;
-
-    // marker_and or marker_expr
-    let first_element = parse_inner(cursor, reporter)?;
-
-    if let Some(expression) = first_element {
-        match tree {
-            Some(ref mut tree) => apply(tree, expression),
-            None => tree = Some(expression),
-        }
+    let first = parse_inner(cursor, reporter)?;
+    cursor.eat_whitespace();
+    let (start, len) = cursor.peek_while(|c| !c.is_whitespace() && c != '(');
+    if cursor.slice(start, len) != op {
+        return Ok(first);
     }
 
+    let mut expressions = SmallVec::<[MarkerTree; 4]>::new();
+    expressions.extend(first);
     loop {
-        // wsp*
+        cursor.take_while(|c| !c.is_whitespace() && c != '(');
+        expressions.extend(parse_inner(cursor, reporter)?);
         cursor.eat_whitespace();
-        // ('or' marker_and) or ('and' marker_or)
-        let (start, len) = cursor.peek_while(|c| !c.is_whitespace());
-        match cursor.slice(start, len) {
-            value if value == op => {
-                cursor.take_while(|c| !c.is_whitespace());
-
-                if let Some(expression) = parse_inner(cursor, reporter)? {
-                    match tree {
-                        Some(ref mut tree) => apply(tree, expression),
-                        None => tree = Some(expression),
-                    }
-                }
-            }
-            _ => return Ok(tree),
+        let (start, len) = cursor.peek_while(|c| !c.is_whitespace() && c != '(');
+        if cursor.slice(start, len) != op {
+            break;
         }
     }
+
+    // Combining adjacent pairs avoids constructing every prefix of a growing diagram.
+    while expressions.len() > 1 {
+        let length = expressions.len();
+        for (output, index) in (0..length).step_by(2).enumerate() {
+            expressions[output] = if index + 1 < length {
+                apply(expressions[index], expressions[index + 1])
+            } else {
+                expressions[index]
+            };
+            // All terms have been parsed, so constant results cannot hide errors or warnings.
+            if (expressions[output].is_true() && op == "or")
+                || (expressions[output].is_false() && op == "and")
+            {
+                return Ok(Some(expressions[output]));
+            }
+        }
+        expressions.truncate(length.div_ceil(2));
+    }
+    Ok(expressions.first().copied())
 }
 
 /// ```text
@@ -660,13 +679,14 @@ pub(crate) fn parse_markers_cursor<T: Pep508Url>(
     if let Some((pos, unexpected)) = cursor.next() {
         // If we're here, both parse_marker_or and parse_marker_and returned because the next
         // character was neither "and" nor "or"
+        let input = cursor.to_string();
         return Err(Pep508Error {
             message: Pep508ErrorSource::String(format!(
                 "Unexpected character '{unexpected}', expected 'and', 'or' or end of input"
             )),
             start: pos,
-            len: cursor.remaining(),
-            input: cursor.to_string(),
+            len: input.len() - pos,
+            input,
         });
     }
 

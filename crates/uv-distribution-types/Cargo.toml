@@ -1,6 +1,6 @@
 [package]
 name = "uv-distribution-types"
-version = "0.0.49"
+version = "0.0.102"
 description = "This is an internal component crate of uv"
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -23,6 +23,7 @@ uv-distribution-filename = { workspace = true }
 uv-errors = { workspace = true }
 uv-fs = { workspace = true }
 uv-git-types = { workspace = true }
+uv-macros = { workspace = true }
 uv-normalize = { workspace = true }
 uv-pep440 = { workspace = true }
 uv-pep508 = { workspace = true }
@@ -33,12 +34,17 @@ uv-redacted = { workspace = true }
 uv-small-str = { workspace = true }
 uv-warnings = { workspace = true }
 
-arcstr = { workspace = true }
 bitflags = { workspace = true }
 fs-err = { workspace = true }
 http = { workspace = true }
 itertools = { workspace = true }
-jiff = { workspace = true }
+jiff = { workspace = true, features = [
+  "tz-system",
+  "tzdb-bundle-platform",
+  "tzdb-concatenated",
+  "tzdb-zoneinfo",
+] }
+memchr = { workspace = true }
 owo-colors = { workspace = true }
 percent-encoding = { workspace = true }
 petgraph = { workspace = true }
@@ -53,7 +59,16 @@ url = { workspace = true }
 version-ranges = { workspace = true }
 
 [dev-dependencies]
+indoc = { workspace = true }
+insta = { workspace = true }
 toml = { workspace = true }
 
 [features]
-schemars = ["dep:schemars", "uv-auth/schemars", "uv-redacted/schemars"]
+schemars = [
+    "dep:schemars",
+    "uv-auth/schemars",
+    "uv-normalize/schemars",
+    "uv-pep508/schemars",
+    "uv-redacted/schemars",
+    "uv-small-str/schemars",
+]

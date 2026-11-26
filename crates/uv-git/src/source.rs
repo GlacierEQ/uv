@@ -10,14 +10,14 @@ use anyhow::Result;
 use tracing::{debug, instrument};
 
 use uv_cache_key::cache_digest;
-use uv_git_types::{GitOid, GitReference, GitUrl};
-use uv_redacted::DisplaySafeUrl;
+use uv_git_types::{GitOid, GitUrl};
+use uv_redacted::SafeUrl;
 
 use crate::credentials::GIT_STORE;
 use crate::git::{GitDatabase, GitRemote};
 
 /// A remote Git source that can be checked out locally.
-pub struct GitSource {
+pub(crate) struct GitSource {
     /// The Git reference from the manifest file.
     git: GitUrl,
     /// Whether to disable SSL verification.
@@ -32,7 +32,7 @@ pub struct GitSource {
 
 impl GitSource {
     /// Initialize a [`GitSource`] with the given Git URL, HTTP client, and cache path.
-    pub fn new(git: GitUrl, cache: impl Into<PathBuf>, offline: bool) -> Self {
+    pub(crate) fn new(git: GitUrl, cache: impl Into<PathBuf>, offline: bool) -> Self {
         Self {
             git,
             disable_ssl: false,
@@ -53,7 +53,7 @@ impl GitSource {
 
     /// Set the [`Reporter`] to use for the [`GitSource`].
     #[must_use]
-    pub fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
+    pub(crate) fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
         Self {
             reporter: Some(reporter),
             ..self
@@ -62,12 +62,12 @@ impl GitSource {
 
     /// Fetch the underlying Git repository at the given revision.
     #[instrument(skip(self), fields(repository = %self.git.url(), rev = ?self.git.precise()))]
-    pub fn fetch(self) -> Result<Fetch> {
+    pub(crate) fn fetch(self) -> Result<Fetch> {
         let lfs_requested = self.git.lfs().enabled();
 
         // The path to the repo, within the Git database.
-        let ident = cache_digest(self.git.repository());
-        let db_path = self.cache.join("db").join(&ident);
+        let repository_digest = cache_digest(self.git.repository());
+        let db_path = self.cache.join("db").join(repository_digest);
 
         // Authenticate the URL, if necessary.
         let remote = if let Some(credentials) = GIT_STORE.get(self.git.repository()) {
@@ -79,7 +79,7 @@ impl GitSource {
         // Fetch the commit, if we don't already have it. Wrapping this section in a closure makes
         // it easier to short-circuit this in the cases where we do have the commit.
         let (db, actual_rev, maybe_task) = || -> Result<(GitDatabase, GitOid, Option<usize>)> {
-            let git_remote = GitRemote::new(&remote);
+            let git_remote = GitRemote::new(remote.clone().into_owned());
             let maybe_db = git_remote.db_at(&db_path).ok();
 
             // If we have a locked revision, and we have a pre-existing database which has that
@@ -95,28 +95,6 @@ impl GitSource {
                         rev,
                         None,
                     ));
-                }
-            }
-
-            // If the revision isn't locked, but it looks like it might be an exact commit hash,
-            // and we do have a pre-existing database, then check whether it is, in fact, a commit
-            // hash. If so, treat it like it's locked.
-            // When requested, we also check if LFS artifacts have been fetched and validated.
-            if let Some(db) = &maybe_db {
-                if let GitReference::BranchOrTagOrCommit(maybe_commit) = self.git.reference() {
-                    if let Ok(oid) = maybe_commit.parse::<GitOid>() {
-                        if db.contains(oid) && (!lfs_requested || db.contains_lfs_artifacts(oid)) {
-                            // This reference is an exact commit. Treat it like it's locked.
-                            debug!("Using existing Git source `{}`", self.git.url());
-                            return Ok((
-                                maybe_db
-                                    .unwrap()
-                                    .with_lfs_ready(lfs_requested.then_some(true)),
-                                oid,
-                                None,
-                            ));
-                        }
-                    }
                 }
             }
 
@@ -143,23 +121,17 @@ impl GitSource {
             Ok((db, actual_rev, task))
         }()?;
 
+        // Validate the resolved commit before checking out its contents.
+        let git = self.git.clone().with_precise(actual_rev)?;
+
         // Don’t use the full hash, in order to contribute less to reaching the
         // path length limit on Windows.
         let short_id = db.to_short_id(actual_rev)?;
 
-        // Compute the canonical URL for the repository checkout.
-        let canonical = self.git.repository().clone().with_lfs(Some(lfs_requested));
-        // Recompute the checkout hash when Git LFS is enabled as we want
-        // to distinctly differentiate between LFS vs non-LFS source trees.
-        let ident = if lfs_requested {
-            cache_digest(&canonical)
-        } else {
-            ident
-        };
         let checkout_path = self
             .cache
             .join("checkouts")
-            .join(&ident)
+            .join(git.repository().checkout_digest(lfs_requested))
             .join(short_id.as_str());
 
         // Check out `actual_rev` from the database to a scoped location on the
@@ -175,7 +147,7 @@ impl GitSource {
         }
 
         Ok(Fetch {
-            git: self.git.with_precise(actual_rev),
+            git,
             path: checkout_path,
             lfs_ready: checkout.lfs_ready().unwrap_or(false),
         })
@@ -207,8 +179,8 @@ impl Fetch {
 
 pub trait Reporter: Send + Sync {
     /// Callback to invoke when a repository checkout begins.
-    fn on_checkout_start(&self, url: &DisplaySafeUrl, rev: &str) -> usize;
+    fn on_checkout_start(&self, url: &SafeUrl, rev: &str) -> usize;
 
     /// Callback to invoke when a repository checkout completes.
-    fn on_checkout_complete(&self, url: &DisplaySafeUrl, rev: &str, index: usize);
+    fn on_checkout_complete(&self, url: &SafeUrl, rev: &str, index: usize);
 }

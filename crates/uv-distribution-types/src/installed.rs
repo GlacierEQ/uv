@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 use fs_err as fs;
 use thiserror::Error;
 use tracing::warn;
-use url::Url;
 
 use uv_cache_info::CacheInfo;
 use uv_distribution_filename::{EggInfoFilename, ExpandedTags};
@@ -15,8 +14,8 @@ use uv_fs::Simplified;
 use uv_install_wheel::WheelFile;
 use uv_normalize::PackageName;
 use uv_pep440::Version;
-use uv_pypi_types::{DirectUrl, MetadataError};
-use uv_redacted::DisplaySafeUrl;
+use uv_pypi_types::{DirectUrl, DirectUrlError, MetadataError, read_direct_url_json};
+use uv_redacted::SafeUrl;
 
 use crate::{
     BuildInfo, DistributionMetadata, InstalledMetadata, InstalledVersion, Name, VersionOrUrlRef,
@@ -48,20 +47,20 @@ pub enum InstalledDistError {
     #[error(transparent)]
     ExpandedTagParse(#[from] uv_distribution_filename::ExpandedTagError),
 
-    #[error("Invalid .egg-link path: `{}`", _0.user_display())]
+    #[error("Invalid `.egg-link` path: {}", _0.user_display())]
     InvalidEggLinkPath(PathBuf),
 
-    #[error("Invalid .egg-link target: `{}`", _0.user_display())]
+    #[error("Invalid `.egg-link` target: {}", _0.user_display())]
     InvalidEggLinkTarget(PathBuf),
 
-    #[error("Failed to parse METADATA file: `{}`", path.user_display())]
+    #[error("Failed to parse `METADATA` file: {}", path.user_display())]
     MetadataParse {
         path: PathBuf,
         #[source]
         err: Box<MetadataError>,
     },
 
-    #[error("Failed to parse `PKG-INFO` file: `{}`", path.user_display())]
+    #[error("Failed to parse `PKG-INFO` file: {}", path.user_display())]
     PkgInfoParse {
         path: PathBuf,
         #[source]
@@ -102,7 +101,7 @@ impl PartialEq for InstalledDist {
 
 impl Eq for InstalledDist {}
 
-/// A built distribution (wheel) that is installed in a virtual environment.
+/// A distribution installed in a Python environment.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum InstalledDistKind {
     /// The distribution was derived from a registry, like `PyPI`.
@@ -131,7 +130,7 @@ pub struct InstalledDirectUrlDist {
     pub name: PackageName,
     pub version: Version,
     pub direct_url: Box<DirectUrl>,
-    pub url: DisplaySafeUrl,
+    pub url: SafeUrl,
     pub editable: bool,
     pub path: Box<Path>,
     pub cache_info: Option<CacheInfo>,
@@ -158,7 +157,7 @@ pub struct InstalledLegacyEditable {
     pub version: Version,
     pub egg_link: Box<Path>,
     pub target: Box<Path>,
-    pub target_url: DisplaySafeUrl,
+    pub target_url: SafeUrl,
     pub egg_info: Box<Path>,
 }
 
@@ -184,33 +183,19 @@ impl InstalledDist {
             let cache_info = Self::read_cache_info(path)?;
             let build_info = Self::read_build_info(path)?;
 
-            return if let Some(direct_url) = Self::read_direct_url(path)? {
-                match DisplaySafeUrl::try_from(&direct_url) {
-                    Ok(url) => Ok(Some(Self::from(InstalledDistKind::Url(
-                        InstalledDirectUrlDist {
-                            name,
-                            version,
-                            editable: matches!(&direct_url, DirectUrl::LocalDirectory { dir_info, .. } if dir_info.editable == Some(true)),
-                            direct_url: Box::new(direct_url),
-                            url,
-                            path: path.to_path_buf().into_boxed_path(),
-                            cache_info,
-                            build_info,
-                        },
-                    )))),
-                    Err(err) => {
-                        warn!("Failed to parse direct URL: {err}");
-                        Ok(Some(Self::from(InstalledDistKind::Registry(
-                            InstalledRegistryDist {
-                                name,
-                                version,
-                                path: path.to_path_buf().into_boxed_path(),
-                                cache_info,
-                                build_info,
-                            },
-                        ))))
-                    }
-                }
+            return if let Some((direct_url, url)) = Self::read_direct_url(path)? {
+                Ok(Some(Self::from(InstalledDistKind::Url(
+                    InstalledDirectUrlDist {
+                        name,
+                        version,
+                        editable: matches!(&direct_url, DirectUrl::LocalDirectory { dir_info, .. } if dir_info.editable == Some(true)),
+                        direct_url: Box::new(direct_url),
+                        url,
+                        path: path.to_path_buf().into_boxed_path(),
+                        cache_info,
+                        build_info,
+                    },
+                ))))
             } else {
                 Ok(Some(Self::from(InstalledDistKind::Registry(
                     InstalledRegistryDist {
@@ -281,8 +266,8 @@ impl InstalledDist {
                 let Some(egg_metadata) = read_metadata(path) else {
                     return Ok(None);
                 };
-                return Ok(Some(Self::from(InstalledDistKind::EggInfoDirectory(
-                    InstalledEggInfoDirectory {
+                return Ok(Some(Self::from(InstalledDistKind::EggInfoFile(
+                    InstalledEggInfoFile {
                         name: file_name.name,
                         version: Version::from_str(&egg_metadata.version)?,
                         path: path.to_path_buf().into_boxed_path(),
@@ -323,7 +308,7 @@ impl InstalledDist {
 
             // Normalisation comes from `pkg_resources.to_filename`.
             let egg_info = target.join(file_stem.replace('-', "_") + ".egg-info");
-            let url = DisplaySafeUrl::from_file_path(&target)
+            let url = SafeUrl::from_file_path(&target)
                 .map_err(|()| InstalledDistError::InvalidEggLinkTarget(path.to_path_buf()))?;
 
             // Mildly unfortunate that we must read metadata to get the version.
@@ -368,17 +353,6 @@ impl InstalledDist {
         }
     }
 
-    /// Return the [`CacheInfo`] of the distribution, if any.
-    pub fn cache_info(&self) -> Option<&CacheInfo> {
-        match &self.kind {
-            InstalledDistKind::Registry(dist) => dist.cache_info.as_ref(),
-            InstalledDistKind::Url(dist) => dist.cache_info.as_ref(),
-            InstalledDistKind::EggInfoDirectory(..) => None,
-            InstalledDistKind::EggInfoFile(..) => None,
-            InstalledDistKind::LegacyEditable(..) => None,
-        }
-    }
-
     /// Return the [`BuildInfo`] of the distribution, if any.
     pub fn build_info(&self) -> Option<&BuildInfo> {
         match &self.kind {
@@ -391,16 +365,21 @@ impl InstalledDist {
     }
 
     /// Read the `direct_url.json` file from a `.dist-info` directory.
-    fn read_direct_url(path: &Path) -> Result<Option<DirectUrl>, InstalledDistError> {
+    fn read_direct_url(path: &Path) -> Result<Option<(DirectUrl, SafeUrl)>, InstalledDistError> {
         let path = path.join("direct_url.json");
         let file = match fs_err::File::open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let direct_url =
-            serde_json::from_reader::<BufReader<fs_err::File>, DirectUrl>(BufReader::new(file))?;
-        Ok(Some(direct_url))
+        match read_direct_url_json(BufReader::new(file)) {
+            Ok(direct_url) => Ok(Some(direct_url)),
+            Err(DirectUrlError::Url(err)) => {
+                warn!("Failed to parse direct URL: {err}");
+                Ok(None)
+            }
+            Err(DirectUrlError::Json(err)) => Err(err.into()),
+        }
     }
 
     /// Read the `uv_cache.json` file from a `.dist-info` directory.
@@ -474,16 +453,6 @@ impl InstalledDist {
         Ok(self.metadata_cache.get().expect("metadata should be set"))
     }
 
-    /// Return the `INSTALLER` of the distribution.
-    pub fn read_installer(&self) -> Result<Option<String>, InstalledDistError> {
-        let path = self.install_path().join("INSTALLER");
-        match fs::read_to_string(path) {
-            Ok(installer) => Ok(Some(installer.trim().to_owned())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-
     /// Return the supported wheel tags for the distribution from the `WHEEL` file, if available.
     pub fn read_tags(&self) -> Result<Option<&ExpandedTags>, InstalledDistError> {
         if let Some(tags) = self.tags_cache.get() {
@@ -522,8 +491,8 @@ impl InstalledDist {
         )
     }
 
-    /// Return the [`Url`] of the distribution, if it is editable.
-    pub fn as_editable(&self) -> Option<&Url> {
+    /// Return the [`SafeUrl`] of the distribution, if it is editable.
+    pub fn as_editable(&self) -> Option<&SafeUrl> {
         match &self.kind {
             InstalledDistKind::Registry(_) => None,
             InstalledDistKind::Url(dist) => dist.editable.then_some(&dist.url),
@@ -534,7 +503,7 @@ impl InstalledDist {
     }
 
     /// Return true if the distribution refers to a local file or directory.
-    pub fn is_local(&self) -> bool {
+    pub(crate) fn is_local(&self) -> bool {
         match &self.kind {
             InstalledDistKind::Registry(_) => false,
             InstalledDistKind::Url(dist) => {

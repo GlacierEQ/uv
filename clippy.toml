@@ -14,6 +14,7 @@ doc-valid-idents = [
   "AArch64",
   "UV_DEV",
   "UV_FROZEN",
+  "UV_INIT_BUILD_BACKEND",
   "UV_ISOLATED",
   "UV_LOCKED",
   "UV_MANAGED_PYTHON",
@@ -22,11 +23,17 @@ doc-valid-idents = [
   "UV_NO_DEV",
   "UV_NO_EDITABLE",
   "UV_NO_ENV_FILE",
+  "UV_NO_INSTALL_LOCAL",
+  "UV_NO_INSTALL_PROJECT",
+  "UV_NO_INSTALL_WORKSPACE",
   "UV_NO_INSTALLER_METADATA",
   "UV_NO_MANAGED_PYTHON",
   "UV_NO_PROGRESS",
   "UV_NO_SYNC",
   "UV_OFFLINE",
+  "UV_ONLY_INSTALL_LOCAL",
+  "UV_ONLY_INSTALL_PROJECT",
+  "UV_ONLY_INSTALL_WORKSPACE",
   "UV_PREVIEW",
   "UV_SHOW_RESOLUTION",
   "UV_VENV_CLEAR",
@@ -35,6 +42,7 @@ doc-valid-idents = [
 ]
 
 disallowed-types = [
+  { path = "url::Url", reason = "Use `uv_redacted::SafeUrl` for redacted formatting and an explicit serialization policy." },
   "std::fs::DirEntry",
   "std::fs::File",
   "std::fs::OpenOptions",
@@ -47,6 +55,18 @@ disallowed-types = [
 ]
 
 disallowed-methods = [
+  "dotenvy::dotenv",
+  "dotenvy::dotenv_override",
+  "dotenvy::from_filename",
+  "dotenvy::from_filename_override",
+  "dotenvy::from_path",
+  "dotenvy::from_path_override",
+  "dotenvy::from_read",
+  "dotenvy::from_read_override",
+  "dotenvy::var",
+  "dotenvy::vars",
+  "dotenvy::Iter::load",
+  "dotenvy::Iter::load_override",
   "std::fs::canonicalize",
   "std::fs::copy",
   "std::fs::create_dir",

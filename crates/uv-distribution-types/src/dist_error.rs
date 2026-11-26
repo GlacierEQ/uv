@@ -13,10 +13,15 @@ use crate::{
     BuiltDist, Dist, DistRef, Edge, Name, Node, RequestedDist, Resolution, ResolvedDist, SourceDist,
 };
 
-/// Inspect whether an error type is a build error.
-pub trait IsBuildBackendError: uv_errors::Hint + std::error::Error + Send + Sync + 'static {
+/// Inspect build failures without depending on their concrete error types.
+pub trait IsBuildBackendError:
+    uv_errors::Hinted + std::error::Error + Send + Sync + 'static
+{
     /// Returns whether the build backend failed to build the package, so it's not a uv error.
     fn is_build_backend_error(&self) -> bool;
+
+    /// Return whether this is an expected user-facing failure.
+    fn is_user_failure(&self) -> bool;
 }
 
 /// The operation(s) that failed when reporting an error with a distribution.
@@ -108,43 +113,38 @@ impl DerivationChain {
             if !seen.insert(node) {
                 continue;
             }
-            match &resolution.graph()[node] {
+            let (name, version) = match &resolution.graph()[node] {
                 Node::Root => {
                     path.reverse();
                     path.pop();
                     return Some(Self::from_iter(path));
                 }
-                Node::Dist { dist, .. } => {
-                    for edge in resolution.graph().edges_directed(node, Direction::Incoming) {
-                        let mut path = path.clone();
-                        path.push(DerivationStep::new(
-                            dist.name().clone(),
-                            extra.clone(),
-                            group.clone(),
-                            dist.version().cloned(),
-                            Ranges::empty(),
-                        ));
-                        let target = edge.source();
-                        let extra = match edge.weight() {
-                            Edge::Optional(extra) => Some(extra.clone()),
-                            _ => None,
-                        };
-                        let group = match edge.weight() {
-                            Edge::Dev(group) => Some(group.clone()),
-                            _ => None,
-                        };
-                        queue.push_back((target, extra, group, path));
-                    }
-                }
+                Node::Dist { dist, .. } => (dist.name(), dist.version()),
+                Node::Excluded { name, version } => (name, version.as_ref()),
+            };
+            for edge in resolution.graph().edges_directed(node, Direction::Incoming) {
+                let mut path = path.clone();
+                path.push(DerivationStep::new(
+                    name.clone(),
+                    extra.clone(),
+                    group.clone(),
+                    version.cloned(),
+                    Ranges::empty(),
+                ));
+                let target = edge.source();
+                let extra = match edge.weight() {
+                    Edge::Optional(extra) => Some(extra.clone()),
+                    _ => None,
+                };
+                let group = match edge.weight() {
+                    Edge::Dev(group) => Some(group.clone()),
+                    _ => None,
+                };
+                queue.push_back((target, extra, group, path));
             }
         }
 
         None
-    }
-
-    /// Returns the length of the derivation chain.
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 
     /// Returns `true` if the derivation chain is empty.

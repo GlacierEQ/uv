@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use uv_fs::Simplified;
-use uv_python::{Interpreter, PythonEnvironment};
+use uv_python_interpreter::{Interpreter, PythonEnvironment};
+pub use uv_python_managed::UpgradePolicy;
 
-pub use virtualenv::{OnExisting, RemovalReason};
+pub use virtualenv::{ClearNonVirtualenv, OnExisting, RemovalReason, Seed};
 
 mod virtualenv;
 
@@ -19,7 +20,7 @@ pub enum Error {
     )]
     NotFound(String),
     #[error(transparent)]
-    Python(#[from] uv_python::managed::Error),
+    Python(#[from] uv_python_managed::Error),
     #[error("A {name} already exists at: {}", path.user_display())]
     Exists {
         /// The type of environment (e.g., "virtual environment" or "directory").
@@ -27,14 +28,27 @@ pub enum Error {
         /// The path to the existing environment.
         path: PathBuf,
     },
+    #[error("uv will not clear a directory that is not a virtual environment")]
+    ClearNonVirtualenv {
+        /// The non-virtual environment directory that would have been cleared.
+        path: PathBuf,
+    },
+    #[error("Virtual environment path is not valid UTF-8: {}", path.user_display())]
+    NonUtf8Path {
+        /// The non-UTF-8 virtual environment path.
+        path: PathBuf,
+    },
 }
 
-impl uv_errors::Hint for Error {
+impl uv_errors::Hinted for Error {
     fn hints(&self) -> uv_errors::Hints<'_> {
         match self {
             Self::Exists { name, .. } => uv_errors::Hints::from(format!(
                 "Use the `--clear` flag or set `UV_VENV_CLEAR=1` to replace the existing {name}",
             )),
+            Self::ClearNonVirtualenv { .. } => uv_errors::Hints::from(
+                "Use the `--force` flag to remove the existing directory anyway",
+            ),
             _ => uv_errors::Hints::none(),
         }
     }
@@ -64,7 +78,6 @@ impl Prompt {
 }
 
 /// Create a virtualenv.
-#[expect(clippy::fn_params_excessive_bools)]
 pub fn create_venv(
     location: &Path,
     interpreter: Interpreter,
@@ -72,8 +85,8 @@ pub fn create_venv(
     system_site_packages: bool,
     on_existing: OnExisting,
     relocatable: bool,
-    seed: bool,
-    upgradeable: bool,
+    seed: Seed,
+    upgrade_policy: UpgradePolicy,
 ) -> Result<PythonEnvironment, Error> {
     // Create the virtualenv at the given location.
     let virtualenv = virtualenv::create(
@@ -84,7 +97,7 @@ pub fn create_venv(
         on_existing,
         relocatable,
         seed,
-        upgradeable,
+        upgrade_policy,
     )?;
 
     // Create the corresponding `PythonEnvironment`.

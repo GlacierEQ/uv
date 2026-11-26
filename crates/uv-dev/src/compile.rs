@@ -5,8 +5,8 @@ use tracing::info;
 
 use uv_cache::{Cache, CacheArgs};
 use uv_configuration::Concurrency;
-use uv_preview::Preview;
-use uv_python::{EnvironmentPreference, PythonEnvironment, PythonPreference, PythonRequest};
+use uv_python_discovery::find_environment;
+use uv_python_types::{EnvironmentPreference, PythonPreference, PythonRequest};
 
 #[derive(Parser)]
 pub(crate) struct CompileArgs {
@@ -23,12 +23,12 @@ pub(crate) async fn compile(args: CompileArgs) -> anyhow::Result<()> {
     let interpreter = if let Some(python) = args.python {
         python
     } else {
-        let interpreter = PythonEnvironment::find(
+        let interpreter = find_environment(
             &PythonRequest::default(),
             EnvironmentPreference::OnlyVirtual,
             PythonPreference::default(),
+            None,
             &cache,
-            Preview::default(),
         )?
         .into_interpreter();
         interpreter.sys_executable().to_path_buf()

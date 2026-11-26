@@ -1,6 +1,8 @@
 use uv_distribution_filename::DistExtension;
 use uv_normalize::{ExtraName, GroupName, PackageName};
+use uv_pep440::Version;
 use uv_pypi_types::{HashDigest, HashDigests};
+use uv_redacted::policy::Raw;
 
 use crate::{
     BuiltDist, Diagnostic, Dist, IndexMetadata, Name, RequirementSource, ResolvedDist, SourceDist,
@@ -8,9 +10,8 @@ use crate::{
 
 /// A set of packages pinned at specific versions.
 ///
-/// This is similar to [`ResolverOutput`], but represents a resolution for a subset of all
-/// marker environments. For example, the resolution is guaranteed to contain at most one version
-/// for a given package.
+/// This represents a resolution for a subset of marker environments and contains at most one
+/// version of each package.
 #[derive(Debug, Default, Clone)]
 pub struct Resolution {
     graph: petgraph::graph::DiGraph<Node, Edge>,
@@ -31,7 +32,7 @@ impl Resolution {
         &self.graph
     }
 
-    /// Add [`Diagnostics`] to the resolution.
+    /// Add [`ResolutionDiagnostic`]s to the resolution.
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: Vec<ResolutionDiagnostic>) -> Self {
         self.diagnostics.extend(diagnostics);
@@ -43,12 +44,7 @@ impl Resolution {
         self.graph
             .node_indices()
             .filter_map(move |node| match &self.graph[node] {
-                Node::Dist {
-                    dist,
-                    hashes,
-                    install,
-                    ..
-                } if *install => Some((dist, hashes.as_slice())),
+                Node::Dist { dist, hashes } => Some((dist, hashes.as_slice())),
                 _ => None,
             })
     }
@@ -59,7 +55,7 @@ impl Resolution {
             .raw_nodes()
             .iter()
             .filter_map(|node| match &node.weight {
-                Node::Dist { dist, install, .. } if *install => Some(dist),
+                Node::Dist { dist, .. } => Some(dist),
                 _ => None,
             })
     }
@@ -83,10 +79,13 @@ impl Resolution {
     #[must_use]
     pub fn filter(mut self, predicate: impl Fn(&ResolvedDist) -> bool) -> Self {
         for node in self.graph.node_weights_mut() {
-            if let Node::Dist { dist, install, .. } = node {
-                if !predicate(dist) {
-                    *install = false;
-                }
+            if let Node::Dist { dist, .. } = node
+                && !predicate(dist)
+            {
+                *node = Node::Excluded {
+                    name: dist.name().clone(),
+                    version: dist.version().cloned(),
+                };
             }
         }
         self
@@ -177,7 +176,7 @@ impl Diagnostic for ResolutionDiagnostic {
     }
 }
 
-/// A node in the resolution, along with whether its been filtered out.
+/// A node in the resolution.
 ///
 /// We retain filtered nodes as we still need to be able to trace dependencies through the graph
 /// (e.g., to determine why a package was included in the resolution).
@@ -187,18 +186,11 @@ pub enum Node {
     Dist {
         dist: ResolvedDist,
         hashes: HashDigests,
-        install: bool,
     },
-}
-
-impl Node {
-    /// Returns `true` if the node should be installed.
-    pub fn install(&self) -> bool {
-        match self {
-            Self::Root => false,
-            Self::Dist { install, .. } => *install,
-        }
-    }
+    Excluded {
+        name: PackageName,
+        version: Option<Version>,
+    },
 }
 
 /// An edge in the resolution graph.
@@ -230,7 +222,7 @@ impl From<&ResolvedDist> for RequirementSource {
                     location.set_fragment(None);
                     Self::Url {
                         url: wheel.url.clone(),
-                        location,
+                        location: location.with_policy(Raw),
                         subdirectory: None,
                         ext: DistExtension::Wheel,
                     }
@@ -258,7 +250,7 @@ impl From<&ResolvedDist> for RequirementSource {
                     location.set_fragment(None);
                     Self::Url {
                         url: sdist.url.clone(),
-                        location,
+                        location: location.with_policy(Raw),
                         subdirectory: sdist.subdirectory.clone(),
                         ext: DistExtension::Source(sdist.ext),
                     }

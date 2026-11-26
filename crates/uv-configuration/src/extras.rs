@@ -8,7 +8,7 @@ use uv_normalize::{DefaultExtras, ExtraName};
 #[derive(Debug, Default, Clone)]
 pub struct ExtrasSpecification(Arc<ExtrasSpecificationInner>);
 
-/// Manager of all dependency-group decisions and settings history.
+/// Extra decisions and settings history shared by an [`ExtrasSpecification`].
 #[derive(Debug, Default, Clone)]
 pub struct ExtrasSpecificationInner {
     /// Extras to include.
@@ -118,7 +118,6 @@ impl ExtrasSpecification {
 
         ExtrasSpecificationWithDefaults {
             cur: Self::from_history(history),
-            prev: self.clone(),
         }
     }
 }
@@ -139,7 +138,7 @@ impl ExtrasSpecificationInner {
     /// and instead just install the extras.
     ///
     /// (This is really just asking if an --only flag was passed.)
-    pub fn prod(&self) -> bool {
+    fn prod(&self) -> bool {
         !self.only_extras
     }
 
@@ -190,12 +189,12 @@ impl ExtrasSpecificationInner {
 /// Context about a [`ExtrasSpecification`][] that we've preserved for diagnostics
 #[derive(Debug, Default, Clone)]
 pub struct ExtrasSpecificationHistory {
-    pub extra: Vec<ExtraName>,
-    pub only_extra: Vec<ExtraName>,
-    pub no_extra: Vec<ExtraName>,
-    pub all_extras: bool,
-    pub no_default_extras: bool,
-    pub defaults: DefaultExtras,
+    extra: Vec<ExtraName>,
+    only_extra: Vec<ExtraName>,
+    no_extra: Vec<ExtraName>,
+    all_extras: bool,
+    no_default_extras: bool,
+    defaults: DefaultExtras,
 }
 
 impl ExtrasSpecificationHistory {
@@ -204,9 +203,7 @@ impl ExtrasSpecificationHistory {
     /// If a flag was provided multiple times (e.g. `--extra A --extra B`) this will
     /// elide the arguments and just show the flag once (e.g. just yield "--extra").
     ///
-    /// Conceptually this being an empty list should be equivalent to
-    /// [`ExtrasSpecification::is_empty`][] when there aren't any defaults set.
-    /// When there are defaults the two will disagree, and rightfully so!
+    /// Default extras are omitted because they do not come from CLI flags.
     pub fn as_flags_pretty(&self) -> Vec<Cow<'_, str>> {
         let Self {
             extra,
@@ -245,32 +242,12 @@ impl ExtrasSpecificationHistory {
 }
 
 /// A trivial newtype wrapped around [`ExtrasSpecification`][] that signifies "defaults applied"
-///
-/// It includes a copy of the previous semantics to provide info on if
-/// the group being a default actually affected it being enabled, because it's obviously "correct".
-/// (These are Arcs so it's ~free to hold onto the previous semantics)
 #[derive(Debug, Clone)]
 pub struct ExtrasSpecificationWithDefaults {
     /// The active semantics
     cur: ExtrasSpecification,
-    /// The semantics before defaults were applied
-    prev: ExtrasSpecification,
 }
 
-impl ExtrasSpecificationWithDefaults {
-    /// Do not enable any extras
-    ///
-    /// Many places in the code need to know what extras are active,
-    /// but various commands or subsystems never enable any extras,
-    /// in which case they want this.
-    pub fn none() -> Self {
-        ExtrasSpecification::default().with_defaults(DefaultExtras::default())
-    }
-    /// Returns `true` if the specification was enabled, and *only* because it was a default
-    pub fn contains_because_default(&self, extra: &ExtraName) -> bool {
-        self.cur.contains(extra) && !self.prev.contains(extra)
-    }
-}
 impl std::ops::Deref for ExtrasSpecificationWithDefaults {
     type Target = ExtrasSpecification;
     fn deref(&self) -> &Self::Target {
@@ -288,7 +265,7 @@ pub enum IncludeExtras {
 
 impl IncludeExtras {
     /// Returns `true` if the specification includes the given extra.
-    pub fn contains(&self, extra: &ExtraName) -> bool {
+    fn contains(&self, extra: &ExtraName) -> bool {
         match self {
             Self::Some(extras) => extras.contains(extra),
             Self::All => true,
@@ -296,20 +273,12 @@ impl IncludeExtras {
     }
 
     /// Returns `true` if the specification will have no effect.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         match self {
             Self::Some(extras) => extras.is_empty(),
             // Although technically this is a noop if they have no extras,
             // conceptually they're *trying* to have an effect, so treat it as one.
             Self::All => false,
-        }
-    }
-
-    /// Iterate over all extras referenced in the [`IncludeExtras`].
-    pub fn names(&self) -> std::slice::Iter<'_, ExtraName> {
-        match self {
-            Self::Some(extras) => extras.iter(),
-            Self::All => [].iter(),
         }
     }
 }

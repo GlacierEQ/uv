@@ -4,13 +4,15 @@ use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use tracing::debug;
 
-use uv_cache::{Cache, Removal};
+use uv_cache::{Cache, RemovalAccounting};
+use uv_command_support::{ExitStatus, Printer};
 use uv_fs::Simplified;
 use uv_normalize::PackageName;
+use uv_preview::{Preview, PreviewFeature};
 
-use crate::commands::reporters::{CleaningDirectoryReporter, CleaningPackageReporter};
-use crate::commands::{ExitStatus, human_readable_bytes};
-use crate::printer::Printer;
+use crate::commands::reporters::{
+    CleaningDirectoryReporter, CleaningPackageReporter, print_removal_summary,
+};
 
 /// Clear the cache, removing all entries or those linked to specific packages.
 pub(crate) async fn cache_clean(
@@ -18,6 +20,7 @@ pub(crate) async fn cache_clean(
     force: bool,
     cache: Cache,
     printer: Printer,
+    preview: Preview,
 ) -> Result<ExitStatus> {
     if !cache.root().exists() {
         writeln!(
@@ -43,6 +46,13 @@ pub(crate) async fn cache_clean(
         }
     };
 
+    let removal_accounting = if preview.is_enabled(PreviewFeature::CachePhysicalSpace) {
+        RemovalAccounting::Fine
+    } else {
+        RemovalAccounting::Coarse
+    };
+    let cache = cache.with_removal_accounting(removal_accounting);
+
     let summary = if packages.is_empty() {
         writeln!(
             printer.stderr(),
@@ -59,49 +69,19 @@ pub(crate) async fn cache_clean(
             .with_context(|| format!("Failed to clear cache at: {}", root.user_display()))?
     } else {
         let reporter = CleaningPackageReporter::new(printer, Some(packages.len()));
-        let mut summary = Removal::default();
+        let mut summary = cache.removal();
 
         for package in packages {
             let removed = cache.remove(package)?;
             summary += removed;
             reporter.on_clean(package.as_str(), &summary);
         }
+        summary += cache.prune_archive_files()?;
         reporter.on_complete();
 
         summary
     };
 
-    // Write a summary of the number of files and directories removed.
-    match (summary.num_files, summary.num_dirs) {
-        (0, 0) => {
-            write!(printer.stderr(), "No cache entries found")?;
-        }
-        (0, 1) => {
-            write!(printer.stderr(), "Removed 1 directory")?;
-        }
-        (0, num_dirs_removed) => {
-            write!(printer.stderr(), "Removed {num_dirs_removed} directories")?;
-        }
-        (1, _) => {
-            write!(printer.stderr(), "Removed 1 file")?;
-        }
-        (num_files_removed, _) => {
-            write!(printer.stderr(), "Removed {num_files_removed} files")?;
-        }
-    }
-
-    // If any, write a summary of the total byte count removed.
-    if summary.total_bytes > 0 {
-        let bytes = if summary.total_bytes < 1024 {
-            format!("{}B", summary.total_bytes)
-        } else {
-            let (bytes, unit) = human_readable_bytes(summary.total_bytes);
-            format!("{bytes:.1}{unit}")
-        };
-        write!(printer.stderr(), " ({})", bytes.green())?;
-    }
-
-    writeln!(printer.stderr())?;
-
+    print_removal_summary(&summary, "No cache entries found", printer)?;
     Ok(ExitStatus::Success)
 }

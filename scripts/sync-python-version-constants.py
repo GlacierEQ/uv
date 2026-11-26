@@ -1,19 +1,23 @@
-"""Update the Python version constants in the test common module.
+"""Update the Python version constants and the Python versions used in CI.
 
 This script reads the download-metadata.json file and extracts the latest
-patch version for each minor version (3.15, 3.14, 3.13, 3.12, 3.11, 3.10).
-It then updates the LATEST_PYTHON_X_Y constants in crates/uv-test/src/lib.rs.
+patch version for each minor version (3.16, 3.15, 3.14, 3.13, 3.12, 3.11, 3.10).
+It then updates the LATEST_PYTHON_X_Y constants in crates/uv-test/src/lib.rs
+and the matching pins in .python-versions.
 
 For minor versions with stable releases, it uses the latest stable version.
 For minor versions with only prereleases, it uses the latest prerelease.
 
 This is called by the sync-python-releases workflow to keep the test constants
-in sync with the latest available Python versions.
+and CI Python versions in sync with the latest available Python versions.
 """
 
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["packaging"]
+# [tool.uv]
+# no-build = true
+# exclude-newer = "P7D"
 # ///
 
 from __future__ import annotations
@@ -26,11 +30,12 @@ from packaging.version import Version
 
 SELF_DIR = Path(__file__).parent
 ROOT = SELF_DIR.parent
+PYTHON_MINOR_VERSIONS = ("3.16", "3.15", "3.14", "3.13", "3.12", "3.11", "3.10")
 
 
 def main() -> None:
     # Read the download metadata
-    metadata_path = ROOT / "crates" / "uv-python" / "download-metadata.json"
+    metadata_path = ROOT / "crates" / "uv-python-managed" / "download-metadata.json"
     with open(metadata_path) as f:
         metadata = json.load(f)
 
@@ -64,36 +69,47 @@ def main() -> None:
 
     # Use stable if available, otherwise prerelease
     latest_versions: dict[str, str] = {}
-    for minor in stable_versions:
-        latest_versions[minor] = stable_versions[minor]
-    for minor in prerelease_versions:
+    for minor, version in stable_versions.items():
+        latest_versions[minor] = version
+    for minor, version in prerelease_versions.items():
         if minor not in latest_versions:
-            latest_versions[minor] = prerelease_versions[minor]
+            latest_versions[minor] = version
 
     # Update the constants in uv-test/src/lib.rs
     lib_path = ROOT / "crates" / "uv-test" / "src" / "lib.rs"
     content = lib_path.read_text()
 
-    # Extract old values first
     old_versions: dict[str, str] = {}
-    for minor in ["3.15", "3.14", "3.13", "3.12", "3.11", "3.10"]:
+    for minor in PYTHON_MINOR_VERSIONS:
         const_name = f"LATEST_PYTHON_{minor.replace('.', '_')}"
-        match = re.search(rf'pub const {const_name}: &str = "([^"]+)";', content)
+        pattern = rf'const {const_name}: &str = "([^"]+)";'
+        match = re.search(pattern, content)
         if match:
             old_versions[minor] = match.group(1)
 
-    for minor in ["3.15", "3.14", "3.13", "3.12", "3.11", "3.10"]:
         if minor not in latest_versions:
             continue
-        const_name = f"LATEST_PYTHON_{minor.replace('.', '_')}"
-        old_pattern = rf'pub const {const_name}: &str = "[^"]+";'
-        new_value = f'pub const {const_name}: &str = "{latest_versions[minor]}";'
-        content = re.sub(old_pattern, new_value, content)
+        new_value = f'const {const_name}: &str = "{latest_versions[minor]}";'
+        content = re.sub(pattern, new_value, content)
 
     lib_path.write_text(content)
 
+    # Update pins matching the previous latest versions, including free-threaded builds.
+    versions_path = ROOT / ".python-versions"
+    content = versions_path.read_text()
+    for minor, old_version in old_versions.items():
+        if minor not in latest_versions:
+            continue
+        content = re.sub(
+            rf"^{re.escape(old_version)}(t?)$",
+            rf"{latest_versions[minor]}\g<1>",
+            content,
+            flags=re.MULTILINE,
+        )
+    versions_path.write_text(content)
+
     updates = []
-    for minor in ["3.15", "3.14", "3.13", "3.12", "3.11", "3.10"]:
+    for minor in PYTHON_MINOR_VERSIONS:
         if minor not in latest_versions:
             continue
         new_version = latest_versions[minor]

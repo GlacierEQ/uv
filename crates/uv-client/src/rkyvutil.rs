@@ -77,7 +77,7 @@ where
     ///
     /// If the bytes fail validation (e.g., contains unaligned pointers or
     /// strings aren't valid UTF-8), then this returns an error.
-    pub fn new(raw: AlignedVec) -> Result<Self, Error> {
+    pub(crate) fn new(raw: AlignedVec) -> Result<Self, Error> {
         // We convert the error to a simple string because... the error type
         // does not implement Send. And I don't think we really need to keep
         // the error type around anyway.
@@ -89,47 +89,19 @@ where
         })
     }
 
-    /// Like `OwnedArchive::new`, but reads the value from the given reader.
-    ///
-    /// Note that this consumes the entirety of the given reader.
-    ///
-    /// # Errors
-    ///
-    /// If the bytes fail validation (e.g., contains unaligned pointers or
-    /// strings aren't valid UTF-8), then this returns an error.
-    pub fn from_reader<R: std::io::Read>(mut rdr: R) -> Result<Self, Error> {
-        let mut buf = AlignedVec::with_capacity(1024);
-        buf.extend_from_reader(&mut rdr).map_err(ErrorKind::Io)?;
-        Self::new(buf)
-    }
-
     /// Creates an owned archive value from the unarchived value.
     ///
     /// # Errors
     ///
     /// This can fail if creating an archive for the given type fails.
     /// Currently, this, at minimum, includes cases where an `A` contains a
-    /// `PathBuf` that is not valid UTF-8.
+    /// `PathBuf` that is not valid UTF-8. This can also fail if validation
+    /// fails, which can generally only occur with a misbehaving `Serialize`
+    /// implementation.
     pub(crate) fn from_unarchived(unarchived: &A) -> Result<Self, Error> {
         let raw = rkyv::to_bytes::<rancor::Error>(unarchived)
             .map_err(|e| ErrorKind::ArchiveWrite(e.to_string()))?;
-        Ok(Self {
-            raw,
-            archive: std::marker::PhantomData,
-        })
-    }
-
-    /// Write the underlying bytes of this archived value to the given writer.
-    ///
-    /// Note that because this type has a `Deref` impl, this method requires
-    /// fully-qualified syntax. So, if `o` is an `OwnedValue`, then use
-    /// `OwnedValue::write(&o, wtr)`.
-    ///
-    /// # Errors
-    ///
-    /// Any failures from writing are returned to the caller.
-    pub fn write<W: std::io::Write>(this: &Self, mut wtr: W) -> Result<(), Error> {
-        Ok(wtr.write_all(&this.raw).map_err(ErrorKind::Io)?)
+        Self::new(raw)
     }
 
     /// Returns the raw underlying bytes of this owned archive value.
@@ -139,7 +111,7 @@ where
     /// Note that because this type has a `Deref` impl, this method requires
     /// fully-qualified syntax. So, if `o` is an `OwnedValue`, then use
     /// `OwnedValue::as_bytes(&o)`.
-    pub fn as_bytes(this: &Self) -> &[u8] {
+    pub(crate) fn as_bytes(this: &Self) -> &[u8] {
         &this.raw
     }
 
@@ -163,9 +135,9 @@ where
 
     fn deref(&self) -> &A::Archived {
         // SAFETY: We've validated that our underlying buffer is a valid
-        // archive for SimpleDetailMetadata in the constructor, so we can skip
-        // validation here. Since we don't mutate the buffer, this conversion
-        // is guaranteed to be correct.
+        // archive in the constructor, so we can skip validation here. Since
+        // we don't mutate the buffer, this conversion is guaranteed to be
+        // correct.
         #[allow(unsafe_code)]
         unsafe {
             rkyv::access_unchecked::<A::Archived>(&self.raw)

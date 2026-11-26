@@ -11,6 +11,7 @@
 
 mod algebra;
 mod environment;
+mod format;
 mod lowering;
 pub(crate) mod parse;
 mod simplify;
@@ -20,9 +21,10 @@ pub use environment::{MarkerEnvironment, MarkerEnvironmentBuilder};
 pub use lowering::{
     CanonicalMarkerValueExtra, CanonicalMarkerValueString, CanonicalMarkerValueVersion,
 };
+pub(crate) use tree::MarkerValue;
 pub use tree::{
     ContainsMarkerTree, ExtraMarkerTree, ExtraOperator, InMarkerTree, MarkerExpression,
-    MarkerOperator, MarkerTree, MarkerTreeContents, MarkerTreeKind, MarkerValue, MarkerValueExtra,
+    MarkerOperator, MarkerTree, MarkerTreeContents, MarkerTreeKind, MarkerValueExtra,
     MarkerValueList, MarkerValueString, MarkerValueVersion, MarkerWarningKind, StringMarkerTree,
     StringVersion, VersionMarkerTree,
 };

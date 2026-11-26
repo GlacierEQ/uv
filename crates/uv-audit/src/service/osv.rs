@@ -1,11 +1,12 @@
 //! Types and interfaces for interacting with [OSV] as a vulnerability service.
 //!
 //! We use OSV's `/v1/querybatch` endpoint to collect vulnerability IDs for all
-//! dependencies in a single round-trip (handling pagination as needed), then
+//! dependencies in batches of up to 1,000 (handling pagination as needed), then
 //! fetch full vulnerability records from `/v1/vulns/{id}` concurrently.
 //!
 //! [OSV]: https://osv.dev/
 
+use std::cmp::Reverse;
 use std::str::FromStr as _;
 use std::sync::LazyLock;
 
@@ -20,11 +21,13 @@ use serde::{Deserialize, Serialize};
 use uv_cache::{Cache, CacheBucket, CacheEntry};
 use uv_client::{CacheControl, CachedClient, CachedClientError};
 use uv_configuration::Concurrency;
+use uv_normalize::PackageName;
 use uv_pep440::Version;
-use uv_redacted::{DisplaySafeUrl, DisplaySafeUrlError};
+use uv_redacted::policy::Raw;
+use uv_redacted::{SafeUrl, SafeUrlError};
 
-pub static API_BASE: LazyLock<DisplaySafeUrl> = LazyLock::new(|| {
-    DisplaySafeUrl::parse("https://api.osv.dev/").expect("embedded OSV URL is a valid URL")
+pub static API_BASE: LazyLock<SafeUrl> = LazyLock::new(|| {
+    SafeUrl::parse("https://api.osv.dev/").expect("embedded OSV URL is a valid URL")
 });
 
 /// Errors during OSV service interactions.
@@ -38,7 +41,7 @@ pub enum Error {
     ReqwestMiddleware(#[from] reqwest_middleware::Error),
     /// An error when constructing the URL for an API request.
     #[error("Invalid API URL: {0}")]
-    Url(DisplaySafeUrl, #[source] DisplaySafeUrlError),
+    Url(SafeUrl, #[source] SafeUrlError),
     /// An error when OSV returns an invalid vulnerability record.
     #[error("OSV returned a malformed vulnerability record for `{id}`")]
     MalformedRecord {
@@ -49,7 +52,7 @@ pub enum Error {
 }
 
 /// Package specification for OSV queries.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Package {
     /// The package's name.
     name: String,
@@ -113,6 +116,7 @@ struct Range {
 /// Package affected by a vulnerability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Affected {
+    package: Option<Package>,
     ranges: Option<Vec<Range>>,
     // TODO: Enable these fields if/when they contain information that's
     // useful to us, e.g. metadata that constrains a vulnerability to specific
@@ -146,7 +150,7 @@ enum ReferenceType {
 struct Reference {
     #[serde(rename = "type")]
     reference_type: ReferenceType,
-    url: DisplaySafeUrl,
+    url: SafeUrl<Raw>,
 }
 
 /// A full vulnerability record from OSV.
@@ -167,6 +171,41 @@ struct Vulnerability {
     affected: Option<Vec<Affected>>,
     aliases: Option<Vec<String>>,
     references: Option<Vec<Reference>>,
+}
+
+impl Vulnerability {
+    fn ids(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(&self.id)
+            .chain(self.aliases.iter().flatten())
+            .map(String::as_str)
+    }
+
+    /// Group the records returned for one dependency by overlapping identifiers.
+    fn deduplicate<'a>(records: impl IntoIterator<Item = &'a Self>) -> impl Iterator<Item = Self> {
+        let mut groups: Vec<Self> = Vec::new();
+        for record in records {
+            let ids: FxHashSet<_> = record.ids().collect();
+            let overlaps = |group: &Self| group.ids().any(|id| ids.contains(id));
+            // A record can join several groups. Keep the position of the first matching group.
+            let first = groups.iter().position(overlaps).unwrap_or(groups.len());
+            let mut newest = record.clone();
+            for mut other in groups.extract_if(first.., |group| overlaps(group)) {
+                // Keep the newest advisory's fix ranges. If timestamps match, choose the record
+                // whose `id` comes first in string order.
+                if (Reverse(other.modified), &other.id) < (Reverse(newest.modified), &newest.id) {
+                    std::mem::swap(&mut newest, &mut other);
+                }
+                let aliases = newest.aliases.get_or_insert_default();
+                aliases.push(other.id);
+                aliases.extend(other.aliases.into_iter().flatten());
+                aliases.retain(|id| *id != newest.id);
+                aliases.sort_unstable();
+                aliases.dedup();
+            }
+            groups.insert(first, newest);
+        }
+        groups.into_iter()
+    }
 }
 
 /// Request body for the batch query API.
@@ -224,9 +263,11 @@ impl Filter {
 static VULN_CACHE_CONTROL: LazyLock<http::HeaderValue> =
     LazyLock::new(|| "max-age=600".parse().expect("valid header value"));
 
+const OSV_QUERY_BATCH_SIZE: usize = 1_000;
+
 /// Represents [OSV](https://osv.dev/), an open-source vulnerability database.
 pub struct Osv {
-    base_url: DisplaySafeUrl,
+    base_url: SafeUrl,
     client: CachedClient,
     concurrency: Concurrency,
     cache: Cache,
@@ -240,7 +281,7 @@ impl Osv {
     /// are cached transparently by the [`CachedClient`].
     pub fn new(
         client: CachedClient,
-        base_url: Option<DisplaySafeUrl>,
+        base_url: Option<SafeUrl>,
         concurrency: Concurrency,
         cache: Cache,
     ) -> Self {
@@ -277,55 +318,59 @@ impl Osv {
         let mut pending: Vec<(&types::Dependency, Option<String>)> =
             dependencies.iter().map(|dep| (dep, None)).collect();
 
+        let url = self
+            .base_url
+            .join("v1/querybatch")
+            .map_err(|err| Error::Url(self.base_url.clone(), err))?;
+
         loop {
-            let request = QueryBatchRequest {
-                queries: pending
-                    .iter()
-                    .map(|(dep, page_token)| QueryRequest {
-                        package: Package {
-                            name: dep.name().to_string(),
-                            ecosystem: "PyPI".to_string(),
-                        },
-                        version: dep.version().to_string(),
-                        page_token: page_token.clone(),
-                    })
-                    .collect(),
-            };
-
-            let url = self
-                .base_url
-                .join("v1/querybatch")
-                .map_err(|e| Error::Url(self.base_url.clone(), e))?;
-
-            // NOTE: we need `uncached` here to access the underlying
-            // client for our POST request.
-            let batch_response: QueryBatchResponse = self
-                .client
-                .uncached()
-                .for_host(&url)
-                .raw_client()
-                .post(url.as_ref())
-                .json(&request)
-                .send()
-                .await?
-                .error_for_status()
-                .map_err(reqwest_middleware::Error::Reqwest)?
-                .json()
-                .await
-                .map_err(reqwest_middleware::Error::Reqwest)?;
-
             let mut next_pending = Vec::new();
-            for ((dep, _), batch_result) in pending.iter().zip(batch_response.results.iter()) {
-                let ids = result_map.entry(dep).or_default();
-                ids.extend(
-                    batch_result
-                        .vulns
+            for pending_batch in pending.chunks(OSV_QUERY_BATCH_SIZE) {
+                let request = QueryBatchRequest {
+                    queries: pending_batch
                         .iter()
-                        .filter(|v| filter.matches(&v.id))
-                        .map(|v| VulnerabilityID::new(v.id.clone())),
-                );
-                if let Some(token) = &batch_result.next_page_token {
-                    next_pending.push((*dep, Some(token.clone())));
+                        .map(|(dep, page_token)| QueryRequest {
+                            package: Package {
+                                name: dep.name().to_string(),
+                                ecosystem: "PyPI".to_string(),
+                            },
+                            version: dep.version().to_string(),
+                            page_token: page_token.clone(),
+                        })
+                        .collect(),
+                };
+
+                // NOTE: we need `uncached` here to access the underlying
+                // client for our POST request.
+                let batch_response: QueryBatchResponse = self
+                    .client
+                    .uncached()
+                    .for_host(&url)
+                    .raw_client()
+                    .post(url.as_str())
+                    .json(&request)
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .map_err(reqwest_middleware::Error::Reqwest)?
+                    .json()
+                    .await
+                    .map_err(reqwest_middleware::Error::Reqwest)?;
+
+                for ((dep, _), batch_result) in
+                    pending_batch.iter().zip(batch_response.results.iter())
+                {
+                    let ids = result_map.entry(dep).or_default();
+                    ids.extend(
+                        batch_result
+                            .vulns
+                            .iter()
+                            .filter(|v| filter.matches(&v.id))
+                            .map(|v| VulnerabilityID::new(v.id.clone())),
+                    );
+                    if let Some(token) = &batch_result.next_page_token {
+                        next_pending.push((*dep, Some(token.clone())));
+                    }
                 }
             }
 
@@ -367,11 +412,9 @@ impl Osv {
         let findings = dep_vuln_ids
             .iter()
             .flat_map(|(dep, vuln_ids)| {
-                vuln_ids.iter().filter_map(|vuln_id| {
-                    vuln_details
-                        .get(vuln_id)
-                        .map(|vuln| Self::vulnerability_to_finding(dep, vuln.clone()))
-                })
+                let records = vuln_ids.iter().filter_map(|id| vuln_details.get(id));
+                Vulnerability::deduplicate(records)
+                    .map(move |record| Self::vulnerability_to_finding(dep, record, vuln_ids))
             })
             .collect();
 
@@ -395,7 +438,7 @@ impl Osv {
             .uncached()
             .for_host(&url)
             .raw_client()
-            .get(url.as_ref())
+            .get(url.as_str())
             .build()
             .map_err(reqwest_middleware::Error::Reqwest)?;
 
@@ -405,7 +448,7 @@ impl Osv {
                 req,
                 &cache_entry,
                 CacheControl::Override(VULN_CACHE_CONTROL.clone()),
-                async |response| response.json::<Vulnerability>().await,
+                async |response, _| response.json::<Vulnerability>().await,
             )
             .await
             .map_err(|err| match err {
@@ -423,6 +466,7 @@ impl Osv {
     fn vulnerability_to_finding(
         dependency: &types::Dependency,
         vuln: Vulnerability,
+        advisory_ids: &FxHashSet<VulnerabilityID>,
     ) -> types::Finding {
         // Extract a link for the advisory. We prefer the first
         // `ADVISORY` reference, then the first `WEB` reference, and then
@@ -440,10 +484,10 @@ impl Osv {
                             matches!(reference.reference_type, ReferenceType::Web)
                         })
                     })
-                    .map(|reference| reference.url.clone())
+                    .map(|reference| reference.url.as_url().clone())
             })
             .unwrap_or_else(|| {
-                DisplaySafeUrl::parse(&format!("https://osv.dev/vulnerability/{}", vuln.id))
+                SafeUrl::parse(&format!("https://osv.dev/vulnerability/{}", vuln.id))
                     .expect("impossible: synthesized URL is invalid")
             });
 
@@ -452,6 +496,13 @@ impl Osv {
             .affected
             .iter()
             .flatten()
+            .filter(|affected| {
+                affected.package.as_ref().is_some_and(|package| {
+                    package.ecosystem == "PyPI"
+                        && PackageName::from_str(&package.name)
+                            .is_ok_and(|name| &name == dependency.name())
+                })
+            })
             .flat_map(|affected| affected.ranges.iter().flatten())
             .filter(|range| matches!(range.range_type, RangeType::Ecosystem))
             .flat_map(|range| &range.events)
@@ -459,33 +510,43 @@ impl Osv {
                 // TODO: Warn on a malformed version string rather than silently skipping it.
                 // Alternatively, we could propagate the raw version string in the finding and
                 // leave it to the callsite to process into PEP 440 versions.
+                Event::Fixed(fixed) if let Ok(version) = Version::from_str(fixed) => Some(version),
                 Event::Fixed(fixed) => {
-                    if let Ok(fixed) = Version::from_str(fixed) {
-                        Some(fixed)
-                    } else {
-                        trace!(
-                            "Skipping invalid (non-PEP 440) version in OSV record {id}: {fixed}",
-                            id = vuln.id,
-                        );
-                        None
-                    }
+                    trace!(
+                        "Skipping invalid (non-PEP 440) version in OSV record {id}: {fixed}",
+                        id = vuln.id,
+                    );
+                    None
                 }
                 _ => None,
             })
             .collect();
 
-        // Extract aliases
-        let aliases = vuln
+        let mut id = VulnerabilityID::new(vuln.id);
+        let mut aliases: Vec<_> = vuln
             .aliases
             .unwrap_or_default()
             .into_iter()
-            .map(types::VulnerabilityID::new)
+            .map(VulnerabilityID::new)
             .collect();
+
+        // Choose the first `id` in string order among the records OSV returned for this group.
+        // An alias qualifies only if it is also a returned record's `id`. This keeps the SARIF
+        // rule ID and fingerprint stable when an advisory's modification time changes.
+        if let Some(primary) = aliases
+            .iter_mut()
+            .filter(|id| advisory_ids.contains(*id))
+            .min()
+            && *primary < id
+        {
+            std::mem::swap(&mut id, primary);
+            aliases.sort_unstable();
+        }
 
         types::Finding::Vulnerability(
             types::Vulnerability::new(
                 dependency.clone(),
-                types::VulnerabilityID::new(vuln.id),
+                id,
                 vuln.summary,
                 vuln.details,
                 Some(link),
@@ -509,15 +570,14 @@ mod tests {
     use uv_configuration::Concurrency;
     use uv_normalize::PackageName;
     use uv_pep440::Version;
-    use uv_redacted::DisplaySafeUrl;
+    use uv_redacted::SafeUrl;
     use wiremock::matchers::{body_json, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use crate::service::osv::{Filter, RangeType};
     use crate::types::{Dependency, Finding};
 
-    use super::Event;
-    use super::Osv;
+    use super::{Event, OSV_QUERY_BATCH_SIZE, Osv, Vulnerability};
 
     /// Create a [`CachedClient`] suitable for tests (no retries, no cache).
     fn test_client() -> CachedClient {
@@ -569,6 +629,41 @@ mod tests {
         ");
     }
 
+    /// A third advisory can connect two records even when neither lists the other's ID.
+    #[test]
+    fn test_deduplicate_transitive_aliases() {
+        let records: Vec<Vulnerability> = serde_json::from_value(json!([
+            {"id": "PYSEC-B", "aliases": ["CVE-1"], "modified": "2026-01-02T00:00:00Z"},
+            {"id": "GHSA-B", "modified": "2026-01-03T00:00:00Z"},
+            {"id": "PYSEC-A", "aliases": ["CVE-2"], "modified": "2026-01-02T00:00:00Z"},
+            {"id": "GHSA-A", "aliases": ["CVE-1", "CVE-2"], "modified": "2026-01-01T00:00:00Z"}
+        ]))
+        .expect("valid OSV vulnerability records");
+
+        let findings: Vec<_> = Vulnerability::deduplicate(&records)
+            .map(|record| (record.id, record.aliases))
+            .collect();
+        insta::assert_debug_snapshot!(findings, @r#"
+        [
+            (
+                "PYSEC-A",
+                Some(
+                    [
+                        "CVE-1",
+                        "CVE-2",
+                        "GHSA-A",
+                        "PYSEC-B",
+                    ],
+                ),
+            ),
+            (
+                "GHSA-B",
+                None,
+            ),
+        ]
+        "#);
+    }
+
     /// Ensure that `query_identifiers` returns the correct vulnerability ID mapping.
     #[tokio::test]
     async fn test_query_identifiers() {
@@ -604,7 +699,7 @@ mod tests {
 
         let osv = Osv::new(
             test_client(),
-            Some(DisplaySafeUrl::parse(&server.uri()).unwrap()),
+            Some(SafeUrl::parse(&server.uri()).unwrap()),
             Concurrency::default(),
             Cache::temp().unwrap(),
         );
@@ -650,6 +745,78 @@ mod tests {
         );
     }
 
+    /// Ensure that `query_identifiers` splits requests at the OSV query batch limit.
+    #[tokio::test]
+    async fn test_query_identifiers_batch_limit() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(|request: &Request| {
+                let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("request body should be valid JSON");
+                let queries = body
+                    .get("queries")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("request body should contain a query array");
+                let results = queries
+                    .iter()
+                    .map(|query| {
+                        if query.get("page_token").is_some() {
+                            json!({ "vulns": [] })
+                        } else {
+                            json!({ "vulns": [], "next_page_token": "next" })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+            })
+            .mount(&server)
+            .await;
+
+        let osv = Osv::new(
+            test_client(),
+            Some(SafeUrl::parse(&server.uri()).unwrap()),
+            Concurrency::default(),
+            Cache::temp().unwrap(),
+        );
+        let dependencies = (0..=OSV_QUERY_BATCH_SIZE)
+            .map(|index| {
+                Dependency::new(
+                    PackageName::from_str(&format!("package-{index}"))
+                        .expect("package name should be valid"),
+                    Version::from_str("1.0.0").expect("version should be valid"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let identifiers = osv
+            .query_identifiers(&dependencies, Filter::All)
+            .await
+            .expect("query should succeed");
+        assert_eq!(identifiers.len(), dependencies.len());
+
+        let mut batch_sizes = server
+            .received_requests()
+            .await
+            .expect("requests should be recorded")
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("request body should be valid JSON")
+                    .get("queries")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("request body should contain a query array")
+                    .len()
+            })
+            .collect::<Vec<_>>();
+        batch_sizes.sort_unstable();
+        assert_eq!(
+            batch_sizes,
+            [1, 1, OSV_QUERY_BATCH_SIZE, OSV_QUERY_BATCH_SIZE]
+        );
+    }
+
     /// Ensure that `query_batch` returns the correct findings for a batch of dependencies
     /// with no pagination (simple case).
     #[tokio::test]
@@ -680,12 +847,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Individual vuln detail requests.
+        // Even when the two records are aliases, each affected dependency needs its own finding.
         Mock::given(method("GET"))
             .and(path("/v1/vulns/VULN-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "VULN-1",
                 "modified": "2026-01-01T00:00:00Z",
+                "aliases": ["VULN-2"],
             })))
             .mount(&server)
             .await;
@@ -701,7 +869,7 @@ mod tests {
 
         let osv = Osv::new(
             test_client(),
-            Some(DisplaySafeUrl::parse(&server.uri()).unwrap()),
+            Some(SafeUrl::parse(&server.uri()).unwrap()),
             Concurrency::default(),
             Cache::temp().unwrap(),
         );
@@ -738,7 +906,7 @@ mod tests {
                     summary: None,
                     description: None,
                     link: Some(
-                        DisplaySafeUrl {
+                        SafeUrl {
                             scheme: "https",
                             cannot_be_a_base: false,
                             username: "",
@@ -755,7 +923,11 @@ mod tests {
                         },
                     ),
                     fix_versions: [],
-                    aliases: [],
+                    aliases: [
+                        VulnerabilityID(
+                            "VULN-2",
+                        ),
+                    ],
                     published: None,
                     modified: Some(
                         2026-01-01T00:00:00Z,
@@ -776,7 +948,7 @@ mod tests {
                     summary: None,
                     description: None,
                     link: Some(
-                        DisplaySafeUrl {
+                        SafeUrl {
                             scheme: "https",
                             cannot_be_a_base: false,
                             username: "",
@@ -896,7 +1068,7 @@ mod tests {
 
         let osv = Osv::new(
             test_client(),
-            Some(DisplaySafeUrl::parse(&server.uri()).unwrap()),
+            Some(SafeUrl::parse(&server.uri()).unwrap()),
             Concurrency::default(),
             Cache::temp().unwrap(),
         );
@@ -980,7 +1152,7 @@ mod tests {
 
         let osv = Osv::new(
             test_client(),
-            Some(DisplaySafeUrl::parse(&server.uri()).unwrap()),
+            Some(SafeUrl::parse(&server.uri()).unwrap()),
             Concurrency::default(),
             Cache::temp().unwrap(),
         );

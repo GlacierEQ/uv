@@ -4,18 +4,20 @@ use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use tracing::debug;
 
-use uv_cache::{Cache, Removal};
+use uv_cache::{Cache, RemovalAccounting};
+use uv_command_support::{ExitStatus, Printer};
 use uv_fs::Simplified;
+use uv_preview::{Preview, PreviewFeature};
 
-use crate::commands::{ExitStatus, human_readable_bytes};
-use crate::printer::Printer;
+use crate::commands::reporters::print_removal_summary;
 
-/// Prune all unreachable objects from the cache.
+/// Prune dangling cache entries and cached environments.
 pub(crate) async fn cache_prune(
     ci: bool,
     force: bool,
     cache: Cache,
     printer: Printer,
+    preview: Preview,
 ) -> Result<ExitStatus> {
     if !cache.root().exists() {
         writeln!(
@@ -41,13 +43,20 @@ pub(crate) async fn cache_prune(
         }
     };
 
+    let removal_accounting = if preview.is_enabled(PreviewFeature::CachePhysicalSpace) {
+        RemovalAccounting::Fine
+    } else {
+        RemovalAccounting::Coarse
+    };
+    let cache = cache.with_removal_accounting(removal_accounting);
+
     writeln!(
         printer.stderr(),
         "Pruning cache at: {}",
         cache.root().user_display().cyan()
     )?;
 
-    let mut summary = Removal::default();
+    let mut summary = cache.removal();
 
     // Prune the source distribution cache, which is tightly coupled to the builder crate.
     summary += uv_distribution::prune(&cache)
@@ -58,37 +67,6 @@ pub(crate) async fn cache_prune(
         .prune(ci)
         .with_context(|| format!("Failed to prune cache at: {}", cache.root().user_display()))?;
 
-    // Write a summary of the number of files and directories removed.
-    match (summary.num_files, summary.num_dirs) {
-        (0, 0) => {
-            write!(printer.stderr(), "No unused entries found")?;
-        }
-        (0, 1) => {
-            write!(printer.stderr(), "Removed 1 directory")?;
-        }
-        (0, num_dirs_removed) => {
-            write!(printer.stderr(), "Removed {num_dirs_removed} directories")?;
-        }
-        (1, _) => {
-            write!(printer.stderr(), "Removed 1 file")?;
-        }
-        (num_files_removed, _) => {
-            write!(printer.stderr(), "Removed {num_files_removed} files")?;
-        }
-    }
-
-    // If any, write a summary of the total byte count removed.
-    if summary.total_bytes > 0 {
-        let bytes = if summary.total_bytes < 1024 {
-            format!("{}B", summary.total_bytes)
-        } else {
-            let (bytes, unit) = human_readable_bytes(summary.total_bytes);
-            format!("{bytes:.1}{unit}")
-        };
-        write!(printer.stderr(), " ({})", bytes.green())?;
-    }
-
-    writeln!(printer.stderr())?;
-
+    print_removal_summary(&summary, "No unused entries found", printer)?;
     Ok(ExitStatus::Success)
 }

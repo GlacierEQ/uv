@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
 use std::path::{Component, Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use tracing::trace;
 
 use uv_fs::write_atomic_sync;
+use uv_pypi_types::Identifier;
 use uv_warnings::warn_user;
 
 use crate::wheel::read_record;
@@ -202,7 +204,7 @@ fn is_path_in_scheme(
             .insert(distribution.to_string())
         {
             warn_user!(
-                "Invalid RECORD entry in {} that escapes the Python environment, skipping: {}",
+                "Invalid `RECORD` entry in `{}` that escapes the Python environment, skipping: {}",
                 distribution,
                 path
             );
@@ -217,7 +219,7 @@ fn is_path_in_scheme(
 /// egg's base location, not arbitrary paths. Treating them as paths can make uninstall delete
 /// directories outside `site-packages`.
 fn is_valid_top_level_entry(entry: &str, distribution: impl Display) -> bool {
-    if is_safe_top_level_entry(entry) {
+    if entry.parse::<Identifier>().is_ok() {
         true
     } else {
         if WARNED_FOR_EGG_TOP_LEVEL_PACKAGE
@@ -234,10 +236,6 @@ fn is_valid_top_level_entry(entry: &str, distribution: impl Display) -> bool {
         }
         false
     }
-}
-
-fn is_safe_top_level_entry(entry: &str) -> bool {
-    !entry.is_empty() && entry != "." && entry != ".." && !entry.contains(['/', '\\'])
 }
 
 /// Uninstall the egg represented by the `.egg-info` directory.
@@ -344,11 +342,11 @@ pub fn uninstall_egg(egg_info: &Path, distribution: impl Display) -> Result<Unin
     })
 }
 
-fn normcase(s: &str) -> String {
+fn normcase(s: &str) -> Cow<'_, str> {
     if cfg!(windows) {
-        s.replace('/', "\\").to_lowercase()
+        Cow::Owned(s.replace('/', "\\").to_lowercase())
     } else {
-        s.to_owned()
+        Cow::Borrowed(s)
     }
 }
 
@@ -429,12 +427,12 @@ pub struct Uninstall {
 /// Source: <https://github.com/rust-lang/cargo/blob/b48c41aedbd69ee3990d62a0e2006edbb506a480/crates/cargo-util/src/paths.rs#L76C1-L109C2>
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().copied() {
-        components.next();
-        PathBuf::from(c.as_os_str())
-    } else {
-        PathBuf::new()
-    };
+    let mut ret = components
+        .next_if_map_mut(|component| match component {
+            Component::Prefix(..) => Some(PathBuf::from(component.as_os_str())),
+            _ => None,
+        })
+        .unwrap_or_default();
 
     for component in components {
         match component {
@@ -457,22 +455,32 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use assert_fs::prelude::*;
+    use indoc::formatdoc;
 
     use uv_pypi_types::Scheme;
 
     use crate::Layout;
-    use crate::uninstall::{is_safe_top_level_entry, uninstall_egg, uninstall_wheel};
+    use crate::uninstall::{is_valid_top_level_entry, uninstall_egg, uninstall_wheel};
 
     #[test]
     fn test_top_level_entry_safe_name() {
-        assert!(is_safe_top_level_entry("package"));
+        let is_valid = |entry| is_valid_top_level_entry(entry, "package");
 
-        assert!(!is_safe_top_level_entry(""));
-        assert!(!is_safe_top_level_entry("."));
-        assert!(!is_safe_top_level_entry(".."));
-        assert!(!is_safe_top_level_entry("../package"));
-        assert!(!is_safe_top_level_entry("package/name"));
-        assert!(!is_safe_top_level_entry(r"package\name"));
+        assert!(is_valid("package"));
+        assert!(is_valid("_package2"));
+
+        assert!(!is_valid(""));
+        assert!(!is_valid("."));
+        assert!(!is_valid(".."));
+        assert!(!is_valid("1package"));
+        assert!(!is_valid("package-name"));
+        assert!(!is_valid("package.name"));
+        assert!(!is_valid("../package"));
+        assert!(!is_valid("package/name"));
+        assert!(!is_valid(r"package\name"));
+        assert!(!is_valid("C:target"));
+        assert!(!is_valid("C:."));
+        assert!(!is_valid("C:.."));
     }
 
     /// Uninstall must not remove files outside the install scheme.
@@ -493,13 +501,14 @@ mod tests {
         assert!(site_packages.join(&target_path).exists());
 
         // Add the invalid path to the RECORD.
-        let record_content = format!(
-            "evilpkg/__init__.py,,0\n\
-             evilpkg-0.1.0.dist-info/METADATA,,0\n\
-             evilpkg-0.1.0.dist-info/RECORD,,\n\
-             {},,0\n",
+        let record_content = formatdoc! {"
+            evilpkg/__init__.py,,0
+            evilpkg-0.1.0.dist-info/METADATA,,0
+            evilpkg-0.1.0.dist-info/RECORD,,
+            {},,0
+        ",
             target_path.display()
-        );
+        };
         dist_info
             .child("RECORD")
             .write_str(&record_content)
@@ -554,7 +563,12 @@ mod tests {
         // Create a fake egg-info directory with a path traversal entry in `top_level.txt`.
         egg_info
             .child("top_level.txt")
-            .write_str(&format!("evilpkg\n{}\n", target_path.display()))
+            .write_str(&formatdoc! {"
+                evilpkg
+                {}
+            ",
+                target_path.display()
+            })
             .unwrap();
 
         // Also create the legitimate package directory so uninstall can remove it.
